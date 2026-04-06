@@ -171,17 +171,24 @@ class Portfolio:
     def _log_trade(self, s: Straddle, exit_reason: str) -> None:
         os.makedirs(config.STATE_DIR, exist_ok=True)
         file_exists = os.path.exists(config.TRADE_LOG_FILE)
+        spot_margin = s.spot_qty * s.entry_spot / config.SPOT_LEVERAGE * s.num_straddles
+        put_cost = s.total_put_cost * s.num_straddles
+        total_capital_used = spot_margin + put_cost
+
         row = {
             "date": s.entry_time[:10],
             "entry_time": s.entry_time,
             "exit_time": s.exit_time,
             "exit_reason": exit_reason,
+            "num_straddles": s.num_straddles,
             "spot_entry": s.entry_spot,
             "spot_exit": s.exit_spot,
             "put_strike": s.put_strike,
             "put_premium_entry": s.entry_put_price,
             "put_premium_exit": s.exit_put_price,
-            "num_straddles": s.num_straddles,
+            "spot_margin_used": round(spot_margin, 2),
+            "put_premium_cost": round(put_cost, 2),
+            "total_capital_used": round(total_capital_used, 2),
             "straddle_cost": s.straddle_cost,
             "capital_before": self._equity - (s.pnl or 0),
             "spot_pnl": s.spot_pnl(s.exit_spot or s.entry_spot),

@@ -35,6 +35,10 @@ class TradeRow:
     num_straddles: int
     straddle_cost: float
     exit_reason: str
+    spot_margin_used: float = 0.0
+    put_premium_cost: float = 0.0
+    total_capital_used: float = 0.0
+    put_strike: float = 0.0
 
 
 @dataclass
@@ -90,6 +94,12 @@ class DailyMetrics:
     daily_vol: float             # stdev of daily returns
     annualised_vol: float
 
+    # Capital / Margin (today's trade)
+    spot_margin_used: float
+    put_premium_cost: float
+    total_capital_used: float
+    put_strike: float
+
 
 def _load_trades() -> list[TradeRow]:
     path = config.TRADE_LOG_FILE
@@ -112,6 +122,10 @@ def _load_trades() -> list[TradeRow]:
                     num_straddles=int(row["num_straddles"]),
                     straddle_cost=float(row["straddle_cost"]),
                     exit_reason=row.get("exit_reason", ""),
+                    spot_margin_used=float(row.get("spot_margin_used", 0)),
+                    put_premium_cost=float(row.get("put_premium_cost", 0)),
+                    total_capital_used=float(row.get("total_capital_used", 0)),
+                    put_strike=float(row.get("put_strike", 0)),
                 ))
             except (ValueError, KeyError):
                 continue
@@ -250,6 +264,10 @@ def compute_report(equity: float) -> Optional[DailyMetrics]:
         expectancy_ratio=expectancy_ratio,
         daily_vol=daily_vol,
         annualised_vol=ann_vol,
+        spot_margin_used=latest.spot_margin_used,
+        put_premium_cost=latest.put_premium_cost,
+        total_capital_used=latest.total_capital_used,
+        put_strike=latest.put_strike,
     )
 
 
@@ -264,13 +282,25 @@ def format_telegram_report(m: DailyMetrics) -> str:
 
     pnl_sign = "+" if m.trade_pnl >= 0 else ""
 
+    leverage = config.SPOT_LEVERAGE
+    notional = m.spot_entry * config.QTY_PER_LEG * m.num_straddles if m.spot_entry else 0
+
     lines = [
         f"<b>DAILY REPORT — {m.trade_date}</b>",
         "",
         "<b>Today's Trade</b>",
         f"  P&L: {pnl_sign}${m.trade_pnl:,.2f} ({pnl_sign}{m.trade_return_pct:.2%})",
         f"  Spot: ${m.spot_entry:,.0f} → ${m.spot_exit:,.0f} ({m.spot_move_pct:+.2%})",
+        f"  Put strike: ${m.put_strike:,.0f}",
         f"  Straddles: {m.num_straddles}",
+        "",
+        "<b>Capital Required (this trade)</b>",
+        f"  Spot margin ({leverage}×): ${m.spot_margin_used:,.2f}",
+        f"    Notional: ${notional:,.2f} / {leverage}× = ${m.spot_margin_used:,.2f}",
+        f"  Option premium: ${m.put_premium_cost:,.2f}",
+        f"    ({config.NUM_PUTS} puts × {config.QTY_PER_LEG} BTC × ${m.put_premium_cost / max(config.NUM_PUTS * config.QTY_PER_LEG * m.num_straddles, 1):,.0f})",
+        f"  <b>Total deployed: ${m.total_capital_used:,.2f}</b>",
+        f"  Equity: ${m.equity + m.trade_pnl:,.2f} → ${m.equity:,.2f}",
         "",
         "<b>Portfolio</b>",
         f"  Equity: ${m.equity:,.2f}",

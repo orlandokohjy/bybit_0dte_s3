@@ -22,7 +22,7 @@ A synthetic straddle replicates the payoff of being long both a call and a put �
 
 ### Execution Details
 
-- **Spot orders** use **Post-Only limit orders** posted at the bid/ask to guarantee **maker status** and earn trading rebates. Orders chase the book (re-post at updated bid/ask every 1 second) until filled.
+- **Spot orders** use **GTC limit orders** posted at the bid/ask for **maker status** and trading rebates. Orders chase the book (cancel and re-post at updated bid/ask every 1 second) until filled.
 - **Option orders** use aggressive IOC (Immediate-or-Cancel) limit orders with price chasing to ensure fills.
 - A **pre-flight capital check** verifies sufficient funds for all legs (spot margin + put premiums with 5% slippage buffer) before placing any trades, preventing orphaned positions.
 
@@ -120,10 +120,99 @@ This connects to Bybit Demo (real market data, simulated fills), runs the full a
 | `QTY_PER_LEG` | 0.5 BTC | BTC per leg per straddle |
 | `NUM_PUTS` | 2 | Put contracts per straddle |
 | `ALLOC_PCT` | 0.60 | 60% of equity allocated per session |
-| `INITIAL_CAPITAL_USD` | 10,000 | Starting equity for compound tracking |
+| `INITIAL_CAPITAL_USD` | 20,000 | Starting equity for compound tracking |
 | `SESSION_ENTRY_UTC` | 14:00 | Daily entry time |
 | `SESSION_CLOSE_UTC` | 18:00 | Daily hard close time |
 | `MAX_DAILY_LOSS_PCT` | 0.10 | Halt trading if daily loss exceeds 10% |
+
+## Margin Methodology
+
+The algo operates within a **Bybit Unified Trading Account (UTA)** and uses two distinct margin products:
+
+### Spot Margin (Cross-Margin)
+
+The long BTC leg uses **spot cross-margin** at 10× leverage:
+
+```
+Spot margin required = (QTY_PER_LEG × spot_price × num_straddles) / SPOT_LEVERAGE
+
+Example: 0.5 BTC × $69,000 × 1 straddle / 10× = $3,450 margin
+         Notional exposure: $34,500
+         Margin locked:     $3,450
+```
+
+- **Product**: Bybit Spot Margin (not perpetual futures)
+- **Leverage**: Set via `/v5/spot-margin-trade/set-leverage` (range 2–10×)
+- **Order flag**: `isLeverage=1` on buy orders tells Bybit to use borrowed USDT
+- **Collateral**: USDT in the UTA; BTC must be enabled as collateral asset
+- **Interest**: Bybit charges hourly interest on borrowed USDT (accrues while position is open)
+- **Rebate**: Spot limit orders earn maker rebates (the reason we use spot instead of perps)
+
+### Option Margin
+
+The put legs are **bought options** (long puts) — these require **no margin**, only the premium paid upfront:
+
+```
+Option cost = NUM_PUTS × QTY_PER_LEG × put_premium × num_straddles
+
+Example: 2 puts × 0.5 BTC × $2,040 × 1 straddle = $2,040
+```
+
+- **Product**: USDT-settled BTC options on Bybit
+- **Margin**: Zero — long options are fully paid, no liquidation risk on the option leg
+- **Settlement**: Cash-settled in USDT at 08:00 UTC daily
+
+### Portfolio Margin / Total Capital
+
+The total capital deployed per session is the sum of both legs:
+
+```
+Total capital = spot_margin + option_premium_cost
+
+Example: $3,450 (spot margin) + $2,040 (2 puts) = $5,490 per straddle
+```
+
+A **pre-flight capital check** runs before any orders are placed:
+1. Computes exact margin + premium cost per straddle
+2. Adds a 5% slippage buffer on the option premium
+3. Calculates max straddles that fit within 60% of current equity
+4. Only proceeds if at least 1 complete straddle can be funded
+
+This prevents orphaned positions (e.g. buying spot but not having enough for the puts).
+
+## Execution Algorithm
+
+### Entry Sequence (14:00 UTC)
+
+1. **Refresh 0DTE option chain** — fetch all USDT-settled puts expiring today
+2. **Select ITM put** — scan from nearest ITM strike upward, pick first with bid/ask spread < 10%
+3. **Pre-flight sizing** — compute capital for N complete straddles within 60% of equity
+4. **Buy spot** (GTC limit at bid for maker rebate):
+   - Post limit buy at current bid price
+   - Wait up to 1 second for fill
+   - If not filled, cancel and re-post at updated bid
+   - Chase up to 15 attempts
+5. **Buy puts** (IOC limit with chase):
+   - Post aggressive limit at ask + 0.2% premium
+   - If not filled, reprice upward (up to 5% above initial ask)
+   - Chase up to 10 attempts per put leg
+   - 2 put legs per straddle, each QTY_PER_LEG BTC
+6. If any leg fails, all previously filled legs are unwound immediately
+
+### Exit Sequence (18:00 UTC)
+
+1. **Sell spot first** — GTC limit at ask, same chase logic as entry
+2. **Sell puts** — IOC limit at bid, walk price down if needed
+3. Log trade, update equity, generate and send daily report via Telegram
+
+### Order Types
+
+| Leg | Order Type | Time in Force | Rationale |
+|-----|-----------|---------------|-----------|
+| Spot buy | Limit | GTC | Post at bid → maker rebate |
+| Spot sell | Limit | GTC | Post at ask → maker rebate |
+| Put buy | Limit | IOC | Aggressive fill with price chase |
+| Put sell | Limit | IOC | Aggressive fill with price chase |
 
 ## Risk Controls
 
@@ -131,4 +220,4 @@ This connects to Bybit Demo (real market data, simulated fills), runs the full a
 - **Daily loss limit** — halts the session if daily P&L drops below -10% of equity
 - **API circuit breaker** — pauses trading after 5 consecutive API errors (5-minute cooldown)
 - **Atomic entry/exit** — if any leg fails, all other legs are unwound immediately
-- **Post-Only enforcement** — spot orders are rejected (not executed as taker) if they would cross the spread
+- **Maker execution** — spot orders post at bid/ask with GTC limits for maker rebate; chase logic re-posts at updated prices
