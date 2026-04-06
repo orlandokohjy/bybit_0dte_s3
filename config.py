@@ -39,7 +39,7 @@ NUM_PUTS: int = 2               # put contracts per straddle (2 × 0.5 BTC)
 
 # ─────────────────────────── Sizing (Compound) ──────────────────
 
-INITIAL_CAPITAL_USD: float = 20_000.0
+INITIAL_CAPITAL_USD: float = 8_000.0
 ALLOC_PCT: float = 0.60        # 60 % of current equity
 
 # ──────────────────────── Option Filters ─────────────────────────
@@ -72,7 +72,7 @@ OPTION_TICK_SIZE: float = 5.0
 
 # ──────────────────── Risk Management ────────────────────────────
 
-MAX_DAILY_LOSS_PCT: float = 0.10            # halt if daily loss > 10 % of equity
+MAX_DAILY_LOSS_PCT: float | None = None      # disabled — no daily loss halt
 CIRCUIT_BREAKER_API_ERRORS: int = 5
 CIRCUIT_BREAKER_COOLDOWN_SEC: float = 300.0
 

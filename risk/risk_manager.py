@@ -23,6 +23,8 @@ class RiskManager:
 
     def check_daily_loss(self) -> RiskVerdict:
         """Block trading if daily loss exceeds MAX_DAILY_LOSS_PCT of equity."""
+        if config.MAX_DAILY_LOSS_PCT is None:
+            return RiskVerdict(True)
         equity = self._portfolio.equity
         if equity <= 0:
             return RiskVerdict(False, "Zero equity")

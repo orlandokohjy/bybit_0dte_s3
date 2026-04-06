@@ -130,10 +130,10 @@ This connects to Bybit Demo (real market data, simulated fills), runs the full a
 | `QTY_PER_LEG` | 0.5 BTC | BTC per leg per straddle |
 | `NUM_PUTS` | 2 | Put contracts per straddle |
 | `ALLOC_PCT` | 0.60 | 60% of equity allocated per session |
-| `INITIAL_CAPITAL_USD` | 20,000 | Starting equity for compound tracking |
+| `INITIAL_CAPITAL_USD` | 8,000 | Starting equity for compound tracking |
 | `SESSION_ENTRY_UTC` | 14:00 | Daily entry time |
 | `SESSION_CLOSE_UTC` | 18:00 | Daily hard close time |
-| `MAX_DAILY_LOSS_PCT` | 0.10 | Halt trading if daily loss exceeds 10% |
+| `MAX_DAILY_LOSS_PCT` | None | Daily loss halt disabled (set to e.g. 0.10 to enable) |
 
 ## Margin Methodology
 
@@ -285,7 +285,7 @@ Current rates are visible on Bybit's [Margin Data page](https://www.bybit.com/an
 ## Risk Controls
 
 - **Pre-flight capital check** — ensures enough funds for *complete* straddles (spot + puts) before placing any orders
-- **Daily loss limit** — halts the session if daily P&L drops below -10% of equity
+- **Daily loss limit** — currently disabled (`None`); set `MAX_DAILY_LOSS_PCT` in config to re-enable
 - **API circuit breaker** — pauses trading after 5 consecutive API errors (5-minute cooldown)
 - **Atomic entry/exit** — if any leg fails, all other legs are unwound immediately
 - **Maker execution** — spot orders post at bid/ask with GTC limits for maker rebate; chase logic re-posts at updated prices
