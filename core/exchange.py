@@ -166,41 +166,73 @@ class BybitExchange:
         return math.ceil(price / tick) * tick
 
     async def _place_spot_limit(self, side: str, qty: float, price: float) -> dict:
-        """Place a single Post-Only limit order on spot (maker only)."""
-        data = await self._call(
-            self._http.place_order,
+        """Place a GTC Limit order on spot margin. Maker when priced at bid/ask."""
+        params = dict(
             category=config.SPOT_CATEGORY,
             symbol=config.SPOT_SYMBOL,
             side=side,
             orderType="Limit",
             qty=str(qty),
             price=str(price),
-            timeInForce="PostOnly",
+            timeInForce="GTC",
             marketUnit="baseCoin",
-            isLeverage=1,
         )
+        if side == "Buy":
+            params["isLeverage"] = 1
+        data = await self._call(self._http.place_order, **params)
         return data["result"]
 
-    async def _get_spot_order_result(self, order_id: str) -> dict | None:
-        """Check if a spot order has been filled."""
-        try:
-            data = await self._call(
-                self._http.get_order_history,
-                category=config.SPOT_CATEGORY,
-                symbol=config.SPOT_SYMBOL,
-                orderId=order_id,
-            )
-            orders = data["result"]["list"]
-            return orders[0] if orders else None
-        except Exception:
-            return None
+    async def _wait_spot_fill(self, order_id: str, price: float, timeout: float = 3.0) -> dict:
+        """
+        Wait for a spot order to fill.  Checks open orders then order history.
+        Returns fill result or empty dict if timed out.
+        """
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            # Check open orders
+            try:
+                data = await self._call(
+                    self._http.get_open_orders,
+                    category=config.SPOT_CATEGORY,
+                    symbol=config.SPOT_SYMBOL,
+                    orderId=order_id,
+                )
+                open_list = data["result"]["list"]
+                if open_list:
+                    status = open_list[0].get("orderStatus")
+                    if status == "Filled":
+                        return open_list[0]
+                    if status == "New":
+                        await asyncio.sleep(0.5)
+                        continue
+                    return {}
+            except Exception:
+                pass
+
+            # Not in open orders — check history
+            try:
+                data = await self._call(
+                    self._http.get_order_history,
+                    category=config.SPOT_CATEGORY,
+                    symbol=config.SPOT_SYMBOL,
+                    orderId=order_id,
+                )
+                hist = data["result"]["list"]
+                if hist:
+                    return hist[0]
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.5)
+
+        return {}
 
     async def buy_spot(self, qty: float) -> dict:
         """
-        Post-Only limit buy BTC spot with margin — chase at bid for maker rebate.
+        Limit buy BTC spot with margin — post at bid for maker rebate.
 
-        Posts at the current bid. If not filled, re-posts at updated bid.
-        Guarantees maker status (PostOnly rejects if it would cross the spread).
+        Uses GTC limit at bid price. If not filled within the chase interval,
+        cancels and re-posts at the updated bid.
         """
         log.info("buy_spot_maker", qty=qty)
         if config.DRY_RUN:
@@ -214,24 +246,15 @@ class BybitExchange:
             else:
                 price = self._round_spot_price(await self.get_spot_price(), "down")
 
-            try:
-                result = await self._place_spot_limit("Buy", qty, price)
-            except RuntimeError as exc:
-                if "170213" in str(exc) or "PostOnly" in str(exc):
-                    log.debug("spot_buy_postonly_rejected", price=price, attempt=attempt + 1)
-                    await asyncio.sleep(config.SPOT_CHASE_INTERVAL_SEC)
-                    continue
-                raise
-
+            result = await self._place_spot_limit("Buy", qty, price)
             order_id = result.get("orderId", "")
             if not order_id:
                 break
 
-            await asyncio.sleep(config.SPOT_CHASE_INTERVAL_SEC)
+            fill = await self._wait_spot_fill(order_id, price, timeout=config.SPOT_CHASE_INTERVAL_SEC)
 
-            order_result = await self._get_spot_order_result(order_id)
-            if order_result and order_result.get("orderStatus") == "Filled":
-                fill_price = float(order_result.get("avgPrice", price))
+            if fill and fill.get("orderStatus") == "Filled":
+                fill_price = float(fill.get("avgPrice", price))
                 log.info("spot_buy_filled", price=fill_price, attempt=attempt + 1)
                 return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
 
@@ -244,9 +267,10 @@ class BybitExchange:
 
     async def sell_spot(self, qty: float) -> dict:
         """
-        Post-Only limit sell BTC spot — chase at ask for maker rebate.
+        Limit sell BTC spot — post at ask for maker rebate.
 
-        Posts at the current ask. If not filled, re-posts at updated ask.
+        Uses GTC limit at ask price. If not filled within the chase interval,
+        cancels and re-posts at the updated ask.
         """
         log.info("sell_spot_maker", qty=qty)
         if config.DRY_RUN:
@@ -260,24 +284,15 @@ class BybitExchange:
             else:
                 price = self._round_spot_price(await self.get_spot_price(), "up")
 
-            try:
-                result = await self._place_spot_limit("Sell", qty, price)
-            except RuntimeError as exc:
-                if "170213" in str(exc) or "PostOnly" in str(exc):
-                    log.debug("spot_sell_postonly_rejected", price=price, attempt=attempt + 1)
-                    await asyncio.sleep(config.SPOT_CHASE_INTERVAL_SEC)
-                    continue
-                raise
-
+            result = await self._place_spot_limit("Sell", qty, price)
             order_id = result.get("orderId", "")
             if not order_id:
                 break
 
-            await asyncio.sleep(config.SPOT_CHASE_INTERVAL_SEC)
+            fill = await self._wait_spot_fill(order_id, price, timeout=config.SPOT_CHASE_INTERVAL_SEC)
 
-            order_result = await self._get_spot_order_result(order_id)
-            if order_result and order_result.get("orderStatus") == "Filled":
-                fill_price = float(order_result.get("avgPrice", price))
+            if fill and fill.get("orderStatus") == "Filled":
+                fill_price = float(fill.get("avgPrice", price))
                 log.info("spot_sell_filled", price=fill_price, attempt=attempt + 1)
                 return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
 

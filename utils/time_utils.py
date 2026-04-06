@@ -22,7 +22,7 @@ def today_expiry_date_str() -> str:
         exp = now.date()
     else:
         exp = (now + timedelta(days=1)).date()
-    return exp.strftime("%d%b%y").upper()     # e.g. 18MAR26
+    return exp.strftime("%-d%b%y").upper()     # e.g. 6APR26 (no leading zero)
 
 
 def format_utc_sgt(dt: datetime) -> str:
