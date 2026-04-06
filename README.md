@@ -49,10 +49,13 @@ bybit_0dte_s3/
 │   └── exit_manager.py         # Hard close at session end
 ├── risk/
 │   └── risk_manager.py         # Daily loss limit, circuit breaker
+├── reporting/
+│   └── daily_report.py         # Quant metrics & Telegram daily report
 ├── utils/
 │   ├── logging_config.py       # Structured logging (structlog)
 │   ├── time_utils.py           # UTC/SGT time helpers
 │   └── volume_tracker.py       # Monthly spot volume tracking
+├── test_run.py                 # Manual test: entry → hold → close on demand
 ├── state/                      # Runtime state (equity, positions, trade log)
 └── logs/                       # Structured JSON logs
 ```
@@ -85,11 +88,29 @@ cp .env.example .env
 
 The bot uses 10× spot margin leverage. Make sure spot margin trading is enabled on your Bybit Unified Trading Account.
 
-### 4. Run
+### 4. Run (production)
 
 ```bash
 python main.py
 ```
+
+### 5. Manual test run (Demo)
+
+Run a single entry → hold → close cycle on demand, without waiting for the scheduler:
+
+```bash
+# In .env, set:
+#   BYBIT_DEMO=true
+#   DRY_RUN=false
+
+# Execute with 60-second hold (default)
+python test_run.py
+
+# Or close immediately after entry (execution test only)
+HOLD_SECONDS=0 python test_run.py
+```
+
+This connects to Bybit Demo (real market data, simulated fills), runs the full algo cycle, and prints the performance report. Use this to verify everything works before going live.
 
 ## Key Parameters (config.py)
 
