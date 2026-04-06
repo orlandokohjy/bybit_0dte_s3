@@ -162,8 +162,8 @@ class BybitExchange:
         """Round spot price to tick size. 'down' for buys, 'up' for sells."""
         tick = config.SPOT_TICK_SIZE
         if direction == "down":
-            return math.floor(price / tick) * tick
-        return math.ceil(price / tick) * tick
+            return round(math.floor(price / tick) * tick, 2)
+        return round(math.ceil(price / tick) * tick, 2)
 
     async def _place_spot_limit(self, side: str, qty: float, price: float) -> dict:
         """Place a GTC Limit order on spot margin. Maker when priced at bid/ask."""
