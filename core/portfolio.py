@@ -19,6 +19,16 @@ from utils.time_utils import now_utc
 
 log = structlog.get_logger(__name__)
 
+TRADE_LOG_FIELDS = [
+    "date", "entry_time", "exit_time", "exit_reason",
+    "num_straddles", "spot_entry", "spot_exit",
+    "put_strike", "put_premium_entry", "put_premium_exit",
+    "spot_margin_used", "put_premium_cost", "total_capital_used",
+    "straddle_cost", "capital_before",
+    "spot_pnl", "put_pnl", "gross_pnl", "fees", "net_pnl",
+    "capital_after",
+]
+
 
 @dataclass
 class StraddleLeg:
@@ -170,7 +180,6 @@ class Portfolio:
 
     def _log_trade(self, s: Straddle, exit_reason: str) -> None:
         os.makedirs(config.STATE_DIR, exist_ok=True)
-        file_exists = os.path.exists(config.TRADE_LOG_FILE)
         spot_margin = s.spot_qty * s.entry_spot / config.SPOT_LEVERAGE * s.num_straddles
         put_cost = s.total_put_cost * s.num_straddles
         total_capital_used = spot_margin + put_cost
@@ -198,8 +207,42 @@ class Portfolio:
             "net_pnl": s.pnl,
             "capital_after": self._equity,
         }
+
+        needs_header = not os.path.exists(config.TRADE_LOG_FILE)
+        if not needs_header:
+            with open(config.TRADE_LOG_FILE, "r") as f:
+                existing_header = f.readline().strip().split(",")
+            if existing_header != TRADE_LOG_FIELDS:
+                needs_header = True
+                log.warning("trade_log_schema_mismatch", rewriting_header=True)
+                self._rewrite_csv_header(existing_header)
+
         with open(config.TRADE_LOG_FILE, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-            if not file_exists:
+            writer = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
+            if needs_header:
                 writer.writeheader()
             writer.writerow(row)
+
+    @staticmethod
+    def _rewrite_csv_header(old_fields: list[str]) -> None:
+        """Rewrite the CSV with the canonical header, re-mapping old rows by position."""
+        import tempfile
+        import shutil
+
+        path = config.TRADE_LOG_FILE
+        tmp = path + ".tmp"
+        with open(path, "r", newline="") as fin, open(tmp, "w", newline="") as fout:
+            reader = csv.reader(fin)
+            writer = csv.DictWriter(fout, fieldnames=TRADE_LOG_FIELDS)
+            writer.writeheader()
+            next(reader)  # skip old header
+            for values in reader:
+                if len(values) == len(old_fields):
+                    row = dict(zip(old_fields, values))
+                elif len(values) == len(TRADE_LOG_FIELDS):
+                    row = dict(zip(TRADE_LOG_FIELDS, values))
+                else:
+                    continue
+                padded = {f: row.get(f, "") for f in TRADE_LOG_FIELDS}
+                writer.writerow(padded)
+        shutil.move(tmp, path)

@@ -148,11 +148,20 @@ async def run_test() -> None:
     # ── Step 6: Hold ──
     if HOLD_SECONDS > 0:
         print(f"[6/7] Holding position for {HOLD_SECONDS}s...")
+        put_symbol = straddle.put_legs[0].instrument
         for elapsed in range(0, HOLD_SECONDS, 10):
             await asyncio.sleep(min(10, HOLD_SECONDS - elapsed))
             cur_spot = await market.get_spot_price()
-            unrealised = straddle.spot_pnl(cur_spot)
-            print(f"  {elapsed + 10:>4d}s | Spot: ${cur_spot:,.2f} | Unrealised spot P&L: ${unrealised:,.2f}")
+            cached_put = exchange.get_cached_option(put_symbol)
+            put_mark = cached_put.mark if cached_put and cached_put.mark > 0 else straddle.entry_put_price
+            spot_unr = straddle.spot_pnl(cur_spot)
+            put_unr = straddle.put_pnl(put_mark)
+            total_unr = spot_unr + put_unr
+            print(
+                f"  {elapsed + 10:>5d}s | Spot: ${cur_spot:,.2f} | "
+                f"Spot P&L: ${spot_unr:,.2f} | Put P&L: ${put_unr:,.2f} | "
+                f"Total: ${total_unr:,.2f}"
+            )
         print()
     else:
         print("[6/7] Hold skipped (HOLD_SECONDS=0)")
