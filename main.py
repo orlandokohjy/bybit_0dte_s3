@@ -201,6 +201,7 @@ class Algo:
             await notifier.notify_daily_summary(
                 self.portfolio.equity, self.portfolio.daily_pnl, cum_return,
             )
+            await notifier.send_daily_report(self.portfolio.equity)
             self.portfolio.reset_daily()
             log.info("session_close_done", pnl=f"${pnl:,.2f}",
                      equity=f"${self.portfolio.equity:,.2f}")
