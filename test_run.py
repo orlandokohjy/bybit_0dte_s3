@@ -74,12 +74,16 @@ async def run_test() -> None:
     # ── Step 1: Connect and show account info ──
     print("[1/7] Connecting to Bybit...")
     if not config.DRY_RUN:
+        await exchange.set_portfolio_margin()
+        await exchange.set_spot_hedging()
         await exchange.set_spot_margin_leverage()
 
+    margin_mode = await exchange.get_margin_mode()
     await market.start()
     spot = await market.get_spot_price()
     wallet_eq = await exchange.get_total_equity_usd()
 
+    print(f"  Margin mode:   {margin_mode}")
     print(f"  Spot price:    ${spot:,.2f}")
     print(f"  Wallet equity: ${wallet_eq:,.2f}")
     print(f"  Local equity:  ${portfolio.equity:,.2f}")

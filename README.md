@@ -84,9 +84,19 @@ cp .env.example .env
 | `TELEGRAM_BOT_TOKEN` | Optional — Telegram bot token for alerts |
 | `TELEGRAM_CHAT_ID` | Optional — Telegram chat ID for alerts |
 
-### 3. Ensure spot margin is activated
+### 3. Bybit account prerequisites
 
-The bot uses 10× spot margin leverage. Make sure spot margin trading is enabled on your Bybit Unified Trading Account.
+The bot auto-configures the following on startup, but your account must meet these prerequisites:
+
+- **Unified Trading Account (UTA)** enabled
+- **Net equity ≥ 1,000 USDC** (required for Portfolio Margin)
+- **BTC enabled as collateral** in UTA settings (required to sell spot BTC)
+- **No Hedge Mode positions** (Portfolio Margin requires One-Way mode)
+
+The bot will automatically:
+1. Switch to **Portfolio Margin** mode (lower maintenance margin for our hedge)
+2. Enable **Spot Hedging** (spot included in stress testing)
+3. Set **10× spot margin leverage**
 
 ### 4. Run (production)
 
@@ -162,7 +172,7 @@ Example: 2 puts × 0.5 BTC × $2,040 × 1 straddle = $2,040
 - **Margin**: Zero — long options are fully paid, no liquidation risk on the option leg
 - **Settlement**: Cash-settled in USDT at 08:00 UTC daily
 
-### Portfolio Margin / Total Capital
+### Total Capital Per Trade
 
 The total capital deployed per session is the sum of both legs:
 
@@ -179,6 +189,64 @@ A **pre-flight capital check** runs before any orders are placed:
 4. Only proceeds if at least 1 complete straddle can be funded
 
 This prevents orphaned positions (e.g. buying spot but not having enough for the puts).
+
+### Portfolio Margin Mode (Recommended)
+
+The algo automatically switches the Bybit UTA to **Portfolio Margin** mode on startup. This is the optimal margin mode for a hedged strategy like ours.
+
+#### Why Portfolio Margin?
+
+Bybit UTA supports three margin modes: Isolated, Cross (default), and Portfolio Margin. Here is how each evaluates our position (Long BTC Spot + Long BTC Puts):
+
+| Mode | Margin Calculation | Hedge Recognition | Our Strategy |
+|------|-------------------|-------------------|--------------|
+| **Isolated** | Per-position | None | **Eliminated** — doesn't support Spot Margin or Options |
+| **Cross** | Sum of individual position margins | None | Works, but treats spot and puts as unrelated |
+| **Portfolio** | Stress testing across entire portfolio | **Yes** — offsets hedged risk | **Optimal** — recognises our spot+puts hedge |
+
+Under **Cross Margin**, Bybit calculates maintenance margin for each position independently and sums them. It doesn't know that our puts protect our spot downside.
+
+Under **Portfolio Margin**, Bybit runs **stress testing** — simulating large price moves and IV shocks — and evaluates the net P&L of the entire portfolio:
+
+```
+Stress scenario (BTC drops 10%):
+  Cross Margin sees:  Spot loss = -$3,450  |  Put margin = $0  →  total risk = $3,450
+  Portfolio Margin:   Spot loss = -$3,450  |  Put gain ≈ +$3,000  →  net risk ≈ $450
+```
+
+The result: **maintenance margin is significantly lower** because the stress-test maximum loss of a hedged portfolio is much smaller than the sum of individual position risks.
+
+#### What is identical across Cross and Portfolio Margin
+
+- **Spot margin borrowing** — same formula, same leverage (10×), same interest rate
+- **Option premium** — same cost (long puts always require only the premium, zero margin)
+- **Execution** — same order types, same API calls
+- **Borrowing interest** — same hourly rate on borrowed USDT
+
+#### What improves with Portfolio Margin
+
+- **Maintenance margin** — reduced via stress-test netting of our hedge
+- **Liquidation risk** — further from liquidation threshold
+- **Capital efficiency** — more free equity available as buffer
+
+#### Setup (automatic)
+
+The algo calls two API endpoints on startup:
+
+1. `POST /v5/account/set-margin-mode` → `PORTFOLIO_MARGIN`
+2. `POST /v5/account/set-hedging-mode` → `ON` (includes spot in stress testing)
+
+**Requirements**: Net equity ≥ 1,000 USDC equivalent, no Hedge Mode positions.
+
+If the account is already in Portfolio Margin mode, the calls are idempotent (no-op with a warning log).
+
+### Borrowing Interest
+
+Bybit charges **hourly interest** on borrowed USDT (the leveraged portion of our spot buy). The rate is floating, based on the USDT lending pool utilisation. For our 4-hour session hold, expect ~4 hours of interest. This is a real cost factored into the trade P&L.
+
+Interest = Borrowed USDT × Hourly Rate × 4 hours
+
+Current rates are visible on Bybit's [Margin Data page](https://www.bybit.com/announcement-info/fullstock-leverage-uta/) or via the `/v5/spot-margin-trade/data` API.
 
 ## Execution Algorithm
 

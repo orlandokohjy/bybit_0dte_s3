@@ -52,19 +52,27 @@ class Algo:
             sys.exit(1)
 
         if not config.DRY_RUN:
+            # 1. Switch to Portfolio Margin (lower maintenance margin for our hedge)
+            await self.exchange.set_portfolio_margin()
+            # 2. Enable Spot Hedging (spot included in stress testing)
+            await self.exchange.set_spot_hedging()
+            # 3. Set spot margin leverage
             await self.exchange.set_spot_margin_leverage()
 
+        margin_mode = await self.exchange.get_margin_mode()
         await self.market.start()
         spot = await self.market.get_spot_price()
 
         log.info("algo_initialized",
                  spot=f"${spot:,.2f}",
-                 equity=f"${self.portfolio.equity:,.2f}")
+                 equity=f"${self.portfolio.equity:,.2f}",
+                 margin_mode=margin_mode)
 
         await notifier.send(
             f"<b>S3 ALGO STARTED</b>\n"
             f"Mode: {'DEMO' if config.DEMO else 'LIVE'}"
             f"{' (DRY RUN)' if config.DRY_RUN else ''}\n"
+            f"Margin: {margin_mode}\n"
             f"Spot: ${spot:,.2f}\n"
             f"Equity: ${self.portfolio.equity:,.2f}\n"
             f"Time: {format_utc_sgt(now_utc())}\n"

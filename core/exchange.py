@@ -93,6 +93,75 @@ class BybitExchange:
                     await asyncio.sleep(self.RETRY_DELAY * (attempt + 1))
         raise last_exc  # type: ignore[misc]
 
+    # ──────────────────── Account Margin Mode ───────────────────────
+
+    async def set_portfolio_margin(self) -> None:
+        """
+        Switch UTA to Portfolio Margin mode via /v5/account/set-margin-mode.
+
+        Portfolio Margin uses stress testing to evaluate the overall portfolio
+        risk, giving lower maintenance margin for hedged positions (our long
+        spot + long puts).  Requires net equity >= 1,000 USDC equivalent.
+        """
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self._http._submit_request(
+                    method="POST",
+                    path=f"{self._http.endpoint}/v5/account/set-margin-mode",
+                    query={"setMarginMode": "PORTFOLIO_MARGIN"},
+                    auth=True,
+                ),
+            )
+            ret_code = result.get("retCode", -1)
+            if ret_code == 0:
+                log.info("margin_mode_set", mode="PORTFOLIO_MARGIN")
+            else:
+                reasons = result.get("result", {}).get("reasons", [])
+                log.warning("margin_mode_set_skipped", retCode=ret_code,
+                            retMsg=result.get("retMsg"), reasons=reasons,
+                            note="May already be in PORTFOLIO_MARGIN mode")
+        except Exception as exc:
+            log.warning("margin_mode_set_failed", error=str(exc))
+
+    async def set_spot_hedging(self) -> None:
+        """
+        Enable Spot Hedging in Portfolio Margin via /v5/account/set-hedging-mode.
+
+        When ON, spot holdings are included in stress-testing scenarios and
+        offset derivatives risk — reducing maintenance margin for our
+        long-spot + long-put portfolio.
+        """
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self._http._submit_request(
+                    method="POST",
+                    path=f"{self._http.endpoint}/v5/account/set-hedging-mode",
+                    query={"setHedgingMode": "ON"},
+                    auth=True,
+                ),
+            )
+            ret_code = result.get("retCode", -1)
+            if ret_code == 0:
+                log.info("spot_hedging_enabled")
+            else:
+                log.warning("spot_hedging_skipped", retCode=ret_code,
+                            retMsg=result.get("retMsg"),
+                            note="May already be enabled")
+        except Exception as exc:
+            log.warning("spot_hedging_failed", error=str(exc))
+
+    async def get_margin_mode(self) -> str:
+        """Return current account margin mode (REGULAR_MARGIN, PORTFOLIO_MARGIN, etc.)."""
+        try:
+            data = await self._call(
+                self._http.get_account_info,
+            )
+            return data["result"].get("marginMode", "UNKNOWN")
+        except Exception:
+            return "UNKNOWN"
+
     # ──────────────────── Spot Margin Leverage ──────────────────────
 
     async def set_spot_margin_leverage(self) -> None:
