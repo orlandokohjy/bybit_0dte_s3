@@ -328,3 +328,30 @@ def format_telegram_report(m: DailyMetrics) -> str:
     ]
 
     return "\n".join(lines)
+
+
+def format_telegram_summary(m: DailyMetrics) -> str:
+    """Short summary: today's trade + volume breakdown."""
+
+    pnl_sign = "+" if m.trade_pnl >= 0 else ""
+    spot_btc = config.QTY_PER_LEG * m.num_straddles
+    num_puts = config.NUM_PUTS * m.num_straddles
+    put_btc = config.QTY_PER_LEG * num_puts
+
+    lines = [
+        f"<b>TRADE SUMMARY — {m.trade_date}</b>",
+        "",
+        "<b>Today's Trade</b>",
+        f"  P&L: {pnl_sign}${m.trade_pnl:,.2f} ({pnl_sign}{m.trade_return_pct:.2%})",
+        f"  Spot: ${m.spot_entry:,.0f} → ${m.spot_exit:,.0f} ({m.spot_move_pct:+.2%})",
+        f"  Put strike: ${m.put_strike:,.0f}",
+        f"  Equity: ${m.equity:,.2f}",
+        "",
+        "<b>Volume</b>",
+        f"  Straddles: {m.num_straddles}",
+        f"  Spot: {m.num_straddles} × {config.QTY_PER_LEG} BTC = {spot_btc:.1f} BTC",
+        f"  Puts: {num_puts} × {config.QTY_PER_LEG} BTC = {put_btc:.1f} BTC",
+        f"  Total BTC exposure: {spot_btc + put_btc:.1f} BTC",
+    ]
+
+    return "\n".join(lines)

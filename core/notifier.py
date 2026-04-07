@@ -75,15 +75,15 @@ async def notify_daily_summary(equity: float, daily_pnl: float, cum_return: floa
 
 
 async def send_daily_report(equity: float) -> None:
-    """Generate and send the full quant performance report."""
-    from reporting.daily_report import compute_report, format_telegram_report
+    """Generate and send both report versions: summary first, then full."""
+    from reporting.daily_report import compute_report, format_telegram_report, format_telegram_summary
     try:
         metrics = compute_report(equity)
         if metrics is None:
             log.info("daily_report_skipped", reason="no trades in log")
             return
-        report_text = format_telegram_report(metrics)
-        await send(report_text)
+        await send(format_telegram_summary(metrics))
+        await send(format_telegram_report(metrics))
         log.info("daily_report_sent", trades=metrics.total_trades, sharpe=f"{metrics.sharpe_ratio:.2f}")
     except Exception:
         log.warning("daily_report_failed", exc_info=True)
