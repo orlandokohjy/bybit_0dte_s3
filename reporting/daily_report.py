@@ -337,10 +337,15 @@ def format_telegram_summary(m: DailyMetrics) -> str:
     spot_btc = config.QTY_PER_LEG * m.num_straddles
     num_puts = config.NUM_PUTS * m.num_straddles
     put_btc = config.QTY_PER_LEG * num_puts
-    spot_usd = spot_btc * m.spot_entry
-    put_usd = put_btc * m.spot_entry
     total_btc = spot_btc + put_btc
-    total_usd = spot_usd + put_usd
+
+    entry_spot_usd = spot_btc * m.spot_entry
+    entry_put_usd = put_btc * m.spot_entry
+    entry_total_usd = entry_spot_usd + entry_put_usd
+
+    exit_spot_usd = spot_btc * m.spot_exit
+    exit_put_usd = put_btc * m.spot_exit
+    exit_total_usd = exit_spot_usd + exit_put_usd
 
     lines = [
         f"<b>TRADE SUMMARY — {m.trade_date}</b>",
@@ -353,9 +358,18 @@ def format_telegram_summary(m: DailyMetrics) -> str:
         "",
         "<b>Volume</b>",
         f"  Straddles: {m.num_straddles}",
-        f"  Spot: {m.num_straddles} × {config.QTY_PER_LEG} BTC = {spot_btc:.1f} BTC (${spot_usd:,.0f})",
-        f"  Puts: {num_puts} × {config.QTY_PER_LEG} BTC = {put_btc:.1f} BTC (${put_usd:,.0f})",
-        f"  Total exposure: {total_btc:.1f} BTC (${total_usd:,.0f})",
+        f"  Spot: {m.num_straddles} × {config.QTY_PER_LEG} = {spot_btc:.1f} BTC",
+        f"  Puts: {num_puts} × {config.QTY_PER_LEG} = {put_btc:.1f} BTC",
+        "",
+        f"  <b>Entry exposure</b> (@ ${m.spot_entry:,.0f})",
+        f"    Spot: ${entry_spot_usd:,.0f}",
+        f"    Puts: ${entry_put_usd:,.0f}",
+        f"    Total: {total_btc:.1f} BTC / ${entry_total_usd:,.0f}",
+        "",
+        f"  <b>Exit exposure</b> (@ ${m.spot_exit:,.0f})",
+        f"    Spot: ${exit_spot_usd:,.0f}",
+        f"    Puts: ${exit_put_usd:,.0f}",
+        f"    Total: {total_btc:.1f} BTC / ${exit_total_usd:,.0f}",
     ]
 
     return "\n".join(lines)
