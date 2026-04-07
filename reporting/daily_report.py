@@ -285,6 +285,15 @@ def format_telegram_report(m: DailyMetrics) -> str:
     leverage = config.SPOT_LEVERAGE
     notional = m.spot_entry * config.QTY_PER_LEG * m.num_straddles if m.spot_entry else 0
 
+    spot_btc = config.QTY_PER_LEG * m.num_straddles
+    num_puts = config.NUM_PUTS * m.num_straddles
+    put_btc = config.QTY_PER_LEG * num_puts
+    total_btc = spot_btc + put_btc
+    entry_spot_usd = spot_btc * m.spot_entry
+    entry_put_usd = put_btc * m.spot_entry
+    exit_spot_usd = spot_btc * m.spot_exit
+    exit_put_usd = put_btc * m.spot_exit
+
     lines = [
         f"<b>DAILY REPORT — {m.trade_date}</b>",
         "",
@@ -293,6 +302,17 @@ def format_telegram_report(m: DailyMetrics) -> str:
         f"  Spot: ${m.spot_entry:,.0f} → ${m.spot_exit:,.0f} ({m.spot_move_pct:+.2%})",
         f"  Put strike: ${m.put_strike:,.0f}",
         f"  Straddles: {m.num_straddles}",
+        "",
+        "<b>Volume</b>",
+        f"  Spot: {m.num_straddles} × {config.QTY_PER_LEG} = {spot_btc:.1f} BTC",
+        f"  Puts: {num_puts} × {config.QTY_PER_LEG} = {put_btc:.1f} BTC",
+        "",
+        f"  <b>Entry</b> (@ ${m.spot_entry:,.0f})",
+        f"    Spot: ${entry_spot_usd:,.0f} | Puts: ${entry_put_usd:,.0f}",
+        f"    Total: {total_btc:.1f} BTC / ${entry_spot_usd + entry_put_usd:,.0f}",
+        f"  <b>Exit</b> (@ ${m.spot_exit:,.0f})",
+        f"    Spot: ${exit_spot_usd:,.0f} | Puts: ${exit_put_usd:,.0f}",
+        f"    Total: {total_btc:.1f} BTC / ${exit_spot_usd + exit_put_usd:,.0f}",
         "",
         "<b>Capital Required (this trade)</b>",
         f"  Spot margin ({leverage}×): ${m.spot_margin_used:,.2f}",
