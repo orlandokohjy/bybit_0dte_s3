@@ -337,6 +337,10 @@ def format_telegram_summary(m: DailyMetrics) -> str:
     spot_btc = config.QTY_PER_LEG * m.num_straddles
     num_puts = config.NUM_PUTS * m.num_straddles
     put_btc = config.QTY_PER_LEG * num_puts
+    spot_usd = spot_btc * m.spot_entry
+    put_usd = put_btc * m.spot_entry
+    total_btc = spot_btc + put_btc
+    total_usd = spot_usd + put_usd
 
     lines = [
         f"<b>TRADE SUMMARY — {m.trade_date}</b>",
@@ -349,9 +353,9 @@ def format_telegram_summary(m: DailyMetrics) -> str:
         "",
         "<b>Volume</b>",
         f"  Straddles: {m.num_straddles}",
-        f"  Spot: {m.num_straddles} × {config.QTY_PER_LEG} BTC = {spot_btc:.1f} BTC",
-        f"  Puts: {num_puts} × {config.QTY_PER_LEG} BTC = {put_btc:.1f} BTC",
-        f"  Total BTC exposure: {spot_btc + put_btc:.1f} BTC",
+        f"  Spot: {m.num_straddles} × {config.QTY_PER_LEG} BTC = {spot_btc:.1f} BTC (${spot_usd:,.0f})",
+        f"  Puts: {num_puts} × {config.QTY_PER_LEG} BTC = {put_btc:.1f} BTC (${put_usd:,.0f})",
+        f"  Total exposure: {total_btc:.1f} BTC (${total_usd:,.0f})",
     ]
 
     return "\n".join(lines)
