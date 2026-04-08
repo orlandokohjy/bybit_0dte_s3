@@ -16,14 +16,14 @@ A synthetic straddle replicates the payoff of being long both a call and a put �
 ### Daily Workflow
 
 1. **14:00 UTC** — Algo sizes the position based on 60% of current equity (compound growth), runs a pre-flight capital check to ensure enough funds for complete straddles, then enters:
-   - Buys BTC spot on margin (Post-Only limit orders for maker rebate)
-   - Buys 2 ITM put options per straddle (aggressive limit chase)
+   - Buys BTC spot on margin (GTC limit at bid — maker)
+   - Buys 2 ITM put options per straddle (GTC limit at bid — maker)
 2. **18:00 UTC** — Hard close: sells all spot then sells all puts. No early exit.
 
 ### Execution Details
 
 - **Spot orders** use **GTC limit orders** posted at the bid/ask for **maker status** and trading rebates. Orders chase the book (cancel and re-post at updated bid/ask every 1 second) until filled.
-- **Option orders** use aggressive IOC (Immediate-or-Cancel) limit orders with price chasing to ensure fills.
+- **Option orders** use **GTC limit orders** posted at the bid (buy) / ask (sell) for **maker status** and trading rebates. Orders chase the book (cancel and re-post at updated bid/ask every 2 seconds) until filled.
 - A **pre-flight capital check** verifies sufficient funds for all legs (spot margin + put premiums with 5% slippage buffer) before placing any trades, preventing orphaned positions.
 
 ## Project Structure
@@ -130,7 +130,7 @@ This connects to Bybit Demo (real market data, simulated fills), runs the full a
 | `QTY_PER_LEG` | 0.5 BTC | BTC per leg per straddle |
 | `NUM_PUTS` | 2 | Put contracts per straddle |
 | `ALLOC_PCT` | 0.60 | 60% of equity allocated per session |
-| `INITIAL_CAPITAL_USD` | 8,000 | Starting equity for compound tracking |
+| `INITIAL_CAPITAL_USD` | 7,900 | Starting equity for compound tracking |
 | `SESSION_ENTRY_UTC` | 14:00 | Daily entry time |
 | `SESSION_CLOSE_UTC` | 18:00 | Daily hard close time |
 | `MAX_DAILY_LOSS_PCT` | None | Daily loss halt disabled (set to e.g. 0.10 to enable) |
@@ -260,17 +260,18 @@ Current rates are visible on Bybit's [Margin Data page](https://www.bybit.com/an
    - Wait up to 1 second for fill
    - If not filled, cancel and re-post at updated bid
    - Chase up to 15 attempts
-5. **Buy puts** (IOC limit with chase):
-   - Post aggressive limit at ask + 0.2% premium
-   - If not filled, reprice upward (up to 5% above initial ask)
-   - Chase up to 10 attempts per put leg
+5. **Buy puts** (GTC limit at bid for maker rebate):
+   - Post limit buy at current bid price
+   - Wait up to 2 seconds for fill
+   - If not filled, cancel and re-post at updated bid
+   - Chase up to 15 attempts per put leg
    - 2 put legs per straddle, each QTY_PER_LEG BTC
 6. If any leg fails, all previously filled legs are unwound immediately
 
 ### Exit Sequence (18:00 UTC)
 
 1. **Sell spot first** — GTC limit at ask, same chase logic as entry
-2. **Sell puts** — IOC limit at bid, walk price down if needed
+2. **Sell puts** — GTC limit at ask, same chase logic as entry
 3. Log trade, update equity, generate and send daily report via Telegram
 
 ### Order Types
@@ -279,8 +280,8 @@ Current rates are visible on Bybit's [Margin Data page](https://www.bybit.com/an
 |-----|-----------|---------------|-----------|
 | Spot buy | Limit | GTC | Post at bid → maker rebate |
 | Spot sell | Limit | GTC | Post at ask → maker rebate |
-| Put buy | Limit | IOC | Aggressive fill with price chase |
-| Put sell | Limit | IOC | Aggressive fill with price chase |
+| Put buy | Limit | GTC | Post at bid → maker rebate |
+| Put sell | Limit | GTC | Post at ask → maker rebate |
 
 ## Risk Controls
 
@@ -288,4 +289,4 @@ Current rates are visible on Bybit's [Margin Data page](https://www.bybit.com/an
 - **Daily loss limit** — currently disabled (`None`); set `MAX_DAILY_LOSS_PCT` in config to re-enable
 - **API circuit breaker** — pauses trading after 5 consecutive API errors (5-minute cooldown)
 - **Atomic entry/exit** — if any leg fails, all other legs are unwound immediately
-- **Maker execution** — spot orders post at bid/ask with GTC limits for maker rebate; chase logic re-posts at updated prices
+- **Maker execution** — all orders (spot + options) post at bid/ask with GTC limits for maker rebate; chase logic re-posts at updated prices

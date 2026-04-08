@@ -3,8 +3,8 @@ Atomic straddle construction and teardown.
 
 One straddle = 0.5 BTC spot margin (long) + 2 × 0.5 BTC ITM put (long).
 
-Entry : spot first (Post-Only limit for maker rebate) → puts (aggressive limit chase × NUM_PUTS)
-Exit  : spot first (Post-Only limit for maker rebate) → puts (aggressive limit chase × NUM_PUTS)
+Entry : spot first (GTC limit at bid — maker) → puts (GTC limit at bid — maker × NUM_PUTS)
+Exit  : spot first (GTC limit at ask — maker) → puts (GTC limit at ask — maker × NUM_PUTS)
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ async def build_straddle(
     log.info("building_straddle", id=straddle_id, spot=spot_price,
              put=put.symbol, strike=put.strike, num=num_straddles)
 
-    # ── Step 1: Buy spot (Post-Only limit for maker rebate) ──
+    # ── Step 1: Buy spot (GTC limit at bid — maker) ──
     try:
         spot_result = await exchange.buy_spot(total_spot_qty)
     except Exception as exc:
@@ -144,7 +144,7 @@ async def unwind_straddle(
 
     log.info("unwinding", id=straddle.id, reason=reason)
 
-    # ── Sell spot (Post-Only limit for maker rebate) ──
+    # ── Sell spot (GTC limit at ask — maker) ──
     try:
         sell_result = await exchange.sell_spot(straddle.spot_leg.qty)
         if not sell_result or not sell_result.get("orderId"):

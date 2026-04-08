@@ -39,7 +39,7 @@ NUM_PUTS: int = 2               # put contracts per straddle (2 × 0.5 BTC)
 
 # ─────────────────────────── Sizing (Compound) ──────────────────
 
-INITIAL_CAPITAL_USD: float = 20_000.0
+INITIAL_CAPITAL_USD: float = 7_900.0
 ALLOC_PCT: float = 0.60        # 60 % of current equity
 
 # ──────────────────────── Option Filters ─────────────────────────
@@ -64,11 +64,9 @@ SPOT_CHASE_INTERVAL_SEC: float = 1.0
 SPOT_CHASE_MAX_ATTEMPTS: int = 15
 SPOT_TICK_SIZE: float = 0.10       # BTCUSDT spot tick size on Bybit
 
-# Options: aggressive limit orders (IOC)
-OPTION_LIMIT_AGGRESSION: float = 0.002     # initial premium over ask (0.2 %)
+# Options: GTC limit on bid/ask for maker rebate (same logic as spot)
 OPTION_CHASE_INTERVAL_SEC: float = 2.0
-OPTION_CHASE_MAX_ATTEMPTS: int = 10
-OPTION_MAX_SLIPPAGE_PCT: float = 0.05      # max 5 % above initial ask
+OPTION_CHASE_MAX_ATTEMPTS: int = 15
 OPTION_TICK_SIZE: float = 5.0
 
 # ──────────────────── Risk Management ────────────────────────────

@@ -225,7 +225,7 @@ class BybitExchange:
         log.info("dry_run_order", side=side, symbol=symbol, qty=qty, price=price, oid=oid)
         return {"orderId": oid, "orderStatus": "Filled", "avgPrice": str(price)}
 
-    # ──────────────────── Spot Margin Orders (Post-Only for maker rebate) ──
+    # ──────────────────── Spot Margin Orders (GTC Limit for maker rebate) ──
 
     def _round_spot_price(self, price: float, direction: str = "down") -> float:
         """Round spot price to tick size. 'down' for buys, 'up' for sells."""
@@ -371,44 +371,59 @@ class BybitExchange:
         log.warning("spot_sell_chase_exhausted", qty=qty)
         return {}
 
-    # ──────────────────── Option Orders ──────────────────────────
+    # ──────────────────── Option Orders (GTC Limit for maker) ──────
 
-    async def buy_put(self, symbol: str, qty: float, price: float) -> dict:
-        tick_price = _round_price_up(price)
-        log.info("buy_put", symbol=symbol, qty=qty, price=tick_price)
-        if config.DRY_RUN:
-            return self._fake_order("Buy", symbol, qty, tick_price)
-        data = await self._call(
-            self._http.place_order,
+    async def _place_option_limit(self, side: str, symbol: str, qty: float, price: float, reduce: bool = False) -> dict:
+        """Place a GTC Limit order on options. Maker when priced at bid/ask."""
+        params = dict(
             category="option",
             symbol=symbol,
-            side="Buy",
+            side=side,
             orderType="Limit",
             qty=str(qty),
-            price=str(tick_price),
-            timeInForce="IOC",
-            orderLinkId=f"bp-{uuid.uuid4().hex[:16]}",
+            price=str(price),
+            timeInForce="GTC",
+            orderLinkId=f"{'bp' if side == 'Buy' else 'sp'}-{uuid.uuid4().hex[:16]}",
         )
+        if reduce:
+            params["reduceOnly"] = True
+        data = await self._call(self._http.place_order, **params)
         return data["result"]
 
-    async def sell_put(self, symbol: str, qty: float, price: float) -> dict:
-        tick_price = _round_price_down(price)
-        log.info("sell_put", symbol=symbol, qty=qty, price=tick_price)
-        if config.DRY_RUN:
-            return self._fake_order("Sell", symbol, qty, tick_price)
-        data = await self._call(
-            self._http.place_order,
-            category="option",
-            symbol=symbol,
-            side="Sell",
-            orderType="Limit",
-            qty=str(qty),
-            price=str(tick_price),
-            timeInForce="IOC",
-            reduceOnly=True,
-            orderLinkId=f"sp-{uuid.uuid4().hex[:16]}",
-        )
-        return data["result"]
+    async def _wait_option_fill(self, symbol: str, order_id: str, timeout: float) -> dict:
+        """Wait for an option order to fill. Checks open orders then history."""
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            try:
+                data = await self._call(
+                    self._http.get_open_orders,
+                    category="option", symbol=symbol, orderId=order_id,
+                )
+                open_list = data["result"]["list"]
+                if open_list:
+                    status = open_list[0].get("orderStatus")
+                    if status == "Filled":
+                        return open_list[0]
+                    if status == "New":
+                        await asyncio.sleep(0.5)
+                        continue
+                    return {}
+            except Exception:
+                pass
+
+            try:
+                data = await self._call(
+                    self._http.get_order_history,
+                    category="option", symbol=symbol, orderId=order_id,
+                )
+                hist = data["result"]["list"]
+                if hist:
+                    return hist[0]
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.5)
+        return {}
 
     async def get_order_status(self, category: str, symbol: str, order_id: str) -> dict | None:
         try:
@@ -437,68 +452,79 @@ class BybitExchange:
     async def chase_buy_put(
         self, symbol: str, qty: float, initial_ask: float,
     ) -> dict | None:
-        """Aggressive fill logic: walk the ask up until filled or exhausted."""
+        """
+        Maker buy: GTC limit at bid, chase the bid until filled.
+
+        Posts at the current bid price for maker rebate. If not filled
+        within the chase interval, cancels and re-posts at the updated bid.
+        """
         if config.DRY_RUN:
             return self._fake_order("Buy", symbol, qty, _round_price_up(initial_ask))
 
-        max_price = _round_price_up(initial_ask * (1 + config.OPTION_MAX_SLIPPAGE_PCT))
-        price = _round_price_up(initial_ask * (1 + config.OPTION_LIMIT_AGGRESSION))
+        log.info("chase_buy_put_maker", symbol=symbol, qty=qty)
 
         for attempt in range(config.OPTION_CHASE_MAX_ATTEMPTS):
-            price = min(price, max_price)
-            result = await self.buy_put(symbol, qty, price)
+            cached = self.get_cached_option(symbol)
+            if cached and cached.bid > 0:
+                price = _round_price_up(cached.bid)
+            else:
+                price = _round_price_up(initial_ask)
+
+            result = await self._place_option_limit("Buy", symbol, qty, price)
             order_id = result.get("orderId", "")
             if not order_id:
                 break
 
-            await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-            order_status = await self.get_order_status("option", symbol, order_id)
+            fill = await self._wait_option_fill(symbol, order_id, timeout=config.OPTION_CHASE_INTERVAL_SEC)
 
-            if order_status is None or order_status.get("orderStatus") == "Filled":
-                log.info("chase_filled", symbol=symbol, price=price, attempt=attempt + 1)
-                return result
+            if fill and fill.get("orderStatus") == "Filled":
+                fill_price = float(fill.get("avgPrice", price))
+                log.info("chase_filled", symbol=symbol, price=fill_price, attempt=attempt + 1)
+                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
 
-            if order_status.get("orderStatus") in ("New", "PartiallyFilled"):
-                await self.cancel_order("option", symbol, order_id)
+            await self.cancel_order("option", symbol, order_id)
+            log.debug("chase_buy_reprice", symbol=symbol, attempt=attempt + 1, price=price)
 
-            price = _round_price_up(price * (1 + config.OPTION_LIMIT_AGGRESSION))
-            log.debug("chase_reprice", symbol=symbol, new_price=price, attempt=attempt + 1)
-            await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-
-        log.warning("chase_exhausted", symbol=symbol, final_price=price)
+        log.warning("chase_exhausted", symbol=symbol)
         return None
 
     async def chase_sell_put(
         self, symbol: str, qty: float, initial_bid: float,
     ) -> dict | None:
-        """Aggressive fill logic for selling a put: walk the bid down."""
+        """
+        Maker sell: GTC limit at ask, chase the ask until filled.
+
+        Posts at the current ask price for maker rebate. If not filled
+        within the chase interval, cancels and re-posts at the updated ask.
+        """
         if config.DRY_RUN:
             return self._fake_order("Sell", symbol, qty, _round_price_down(initial_bid))
 
-        min_price = _round_price_down(initial_bid * (1 - config.OPTION_MAX_SLIPPAGE_PCT))
-        price = _round_price_down(initial_bid * (1 - config.OPTION_LIMIT_AGGRESSION))
+        log.info("chase_sell_put_maker", symbol=symbol, qty=qty)
 
         for attempt in range(config.OPTION_CHASE_MAX_ATTEMPTS):
-            price = max(price, min_price)
-            result = await self.sell_put(symbol, qty, price)
+            cached = self.get_cached_option(symbol)
+            if cached and cached.ask > 0:
+                price = _round_price_down(cached.ask)
+            else:
+                price = _round_price_down(initial_bid)
+
+            result = await self._place_option_limit("Sell", symbol, qty, price, reduce=True)
             order_id = result.get("orderId", "")
             if not order_id:
                 break
 
-            await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-            order_status = await self.get_order_status("option", symbol, order_id)
+            fill = await self._wait_option_fill(symbol, order_id, timeout=config.OPTION_CHASE_INTERVAL_SEC)
 
-            if order_status is None or order_status.get("orderStatus") == "Filled":
-                log.info("chase_sell_filled", symbol=symbol, price=price, attempt=attempt + 1)
-                return result
+            if fill and fill.get("orderStatus") == "Filled":
+                fill_price = float(fill.get("avgPrice", price))
+                log.info("chase_sell_filled", symbol=symbol, price=fill_price, attempt=attempt + 1)
+                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
 
-            if order_status.get("orderStatus") in ("New", "PartiallyFilled"):
-                await self.cancel_order("option", symbol, order_id)
+            await self.cancel_order("option", symbol, order_id)
+            log.debug("chase_sell_reprice", symbol=symbol, attempt=attempt + 1, price=price)
 
-            price = _round_price_down(price * (1 - config.OPTION_LIMIT_AGGRESSION))
-            await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-
-        log.warning("chase_sell_exhausted", symbol=symbol, final_price=price)
+        log.warning("chase_sell_exhausted", symbol=symbol)
         return None
 
     # ─────────────────── WebSocket Streams ───────────────────────
