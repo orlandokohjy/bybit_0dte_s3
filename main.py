@@ -83,6 +83,7 @@ class Algo:
         self.scheduler.register_session(
             on_entry=self._on_entry,
             on_close=self._on_close,
+            on_report=self._on_report,
         )
         self.scheduler.start()
 
@@ -209,13 +210,21 @@ class Algo:
             await notifier.notify_daily_summary(
                 self.portfolio.equity, self.portfolio.daily_pnl, cum_return,
             )
-            await notifier.send_daily_report(self.portfolio.equity)
             self.portfolio.reset_daily()
             log.info("session_close_done", pnl=f"${pnl:,.2f}",
                      equity=f"${self.portfolio.equity:,.2f}")
         except Exception:
             log.error("close_error", exc_info=True)
             await notifier.notify_error("Close", "Unhandled exception — check logs")
+
+    # ──────────────────── Daily Report (19:00 UTC) ────────────────
+
+    async def _on_report(self) -> None:
+        try:
+            await notifier.send_daily_report(self.portfolio.equity)
+        except Exception:
+            log.error("report_error", exc_info=True)
+            await notifier.notify_error("Report", "Daily report failed — check logs")
 
     # ──────────────────── Shutdown ────────────────────────────────
 

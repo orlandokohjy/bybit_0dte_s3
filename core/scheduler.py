@@ -18,7 +18,9 @@ class Scheduler:
     def __init__(self) -> None:
         self._scheduler = AsyncIOScheduler(timezone=UTC)
 
-    def register_session(self, on_entry: callable, on_close: callable) -> None:
+    def register_session(
+        self, on_entry: callable, on_close: callable, on_report: callable,
+    ) -> None:
         weekdays = ",".join(
             ["mon", "tue", "wed", "thu", "fri"][d] for d in sorted(config.ALLOWED_WEEKDAYS)
         )
@@ -31,7 +33,7 @@ class Scheduler:
                 day_of_week=weekdays, timezone=UTC,
             ),
             id="session_entry",
-            name="Session Entry (14:00 UTC)",
+            name=f"Session Entry ({entry_t.hour:02d}:{entry_t.minute:02d} UTC)",
             replace_existing=True,
         )
 
@@ -43,7 +45,19 @@ class Scheduler:
                 day_of_week=weekdays, timezone=UTC,
             ),
             id="session_close",
-            name="Session Close (18:00 UTC)",
+            name=f"Session Close ({close_t.hour:02d}:{close_t.minute:02d} UTC)",
+            replace_existing=True,
+        )
+
+        report_t = config.REPORT_UTC
+        self._scheduler.add_job(
+            on_report,
+            CronTrigger(
+                hour=report_t.hour, minute=report_t.minute,
+                day_of_week=weekdays, timezone=UTC,
+            ),
+            id="daily_report",
+            name=f"Daily Report ({report_t.hour:02d}:{report_t.minute:02d} UTC)",
             replace_existing=True,
         )
 
@@ -51,6 +65,7 @@ class Scheduler:
             "session_scheduled",
             entry=f"{entry_t.hour:02d}:{entry_t.minute:02d} UTC",
             close=f"{close_t.hour:02d}:{close_t.minute:02d} UTC",
+            report=f"{report_t.hour:02d}:{report_t.minute:02d} UTC",
             days=weekdays,
         )
 
