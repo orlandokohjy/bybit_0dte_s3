@@ -372,8 +372,6 @@ def format_telegram_summary(m: DailyMetrics) -> str:
         "",
         "<b>Today's Trade</b>",
         f"  P&L: {pnl_sign}${m.trade_pnl:,.2f} ({pnl_sign}{m.trade_return_pct:.2%})",
-        f"  Spot: ${m.spot_entry:,.0f} → ${m.spot_exit:,.0f} ({m.spot_move_pct:+.2%})",
-        f"  Put strike: ${m.put_strike:,.0f}",
         f"  Equity: ${m.equity:,.2f}",
         "",
         "<b>Volume</b>",
