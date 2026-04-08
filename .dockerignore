@@ -1,0 +1,17 @@
+.env
+.env.*
+state/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.DS_Store
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+test_run.py
+README.md

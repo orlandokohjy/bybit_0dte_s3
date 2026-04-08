@@ -1,0 +1,12 @@
+services:
+  algo:
+    build: .
+    container_name: bybit_0dte_s3
+    restart: always
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=UTC
+    volumes:
+      - ./state:/app/state
+      - ./logs:/app/logs
