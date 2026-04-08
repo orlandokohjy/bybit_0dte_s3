@@ -453,26 +453,34 @@ class BybitExchange:
         self, symbol: str, qty: float, initial_bid: float,
     ) -> dict | None:
         """
-        Maker buy: GTC limit at bid, chase the bid until filled.
+        Escalating maker buy: start at bid, walk up by 1 tick per attempt.
 
-        Posts at the current bid price for maker rebate. If not filled
-        within the chase interval, cancels and re-posts at the updated bid.
+        Never crosses the spread (price capped at ask - 1 tick), so every
+        order is a maker order.  On each attempt the price improves by one
+        option tick ($5) to attract a fill.
 
         Args:
-            initial_bid: REST-snapshot bid price, used as fallback when
-                         the option WebSocket hasn't delivered data yet.
+            initial_bid: REST-snapshot bid price, used as starting price
+                         when the option WebSocket hasn't delivered data yet.
         """
         if config.DRY_RUN:
             return self._fake_order("Buy", symbol, qty, _round_price_up(initial_bid))
 
         log.info("chase_buy_put_maker", symbol=symbol, qty=qty)
+        tick = config.OPTION_TICK_SIZE
 
         for attempt in range(config.OPTION_CHASE_MAX_ATTEMPTS):
             cached = self.get_cached_option(symbol)
+
             if cached and cached.bid > 0:
-                price = _round_price_up(cached.bid)
+                base_price = cached.bid
+                ceiling = cached.ask - tick if cached.ask > 0 else cached.bid + tick * 10
             else:
-                price = _round_price_up(initial_bid)
+                base_price = initial_bid
+                ceiling = initial_bid + tick * 10
+
+            price = _round_price_up(base_price + tick * attempt)
+            price = min(price, _round_price_up(ceiling))
 
             result = await self._place_option_limit("Buy", symbol, qty, price)
             order_id = result.get("orderId", "")
@@ -496,26 +504,34 @@ class BybitExchange:
         self, symbol: str, qty: float, initial_ask: float,
     ) -> dict | None:
         """
-        Maker sell: GTC limit at ask, chase the ask until filled.
+        Escalating maker sell: start at ask, walk down by 1 tick per attempt.
 
-        Posts at the current ask price for maker rebate. If not filled
-        within the chase interval, cancels and re-posts at the updated ask.
+        Never crosses the spread (price floored at bid + 1 tick), so every
+        order is a maker order.  On each attempt the price improves by one
+        option tick ($5) to attract a fill.
 
         Args:
-            initial_ask: REST-snapshot ask price, used as fallback when
-                         the option WebSocket hasn't delivered data yet.
+            initial_ask: REST-snapshot ask price, used as starting price
+                         when the option WebSocket hasn't delivered data yet.
         """
         if config.DRY_RUN:
             return self._fake_order("Sell", symbol, qty, _round_price_down(initial_ask))
 
         log.info("chase_sell_put_maker", symbol=symbol, qty=qty)
+        tick = config.OPTION_TICK_SIZE
 
         for attempt in range(config.OPTION_CHASE_MAX_ATTEMPTS):
             cached = self.get_cached_option(symbol)
+
             if cached and cached.ask > 0:
-                price = _round_price_down(cached.ask)
+                base_price = cached.ask
+                floor = cached.bid + tick if cached.bid > 0 else max(tick, cached.ask - tick * 10)
             else:
-                price = _round_price_down(initial_ask)
+                base_price = initial_ask
+                floor = max(tick, initial_ask - tick * 10)
+
+            price = _round_price_down(base_price - tick * attempt)
+            price = max(price, _round_price_down(floor))
 
             result = await self._place_option_limit("Sell", symbol, qty, price, reduce=True)
             order_id = result.get("orderId", "")

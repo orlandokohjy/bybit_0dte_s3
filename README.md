@@ -23,7 +23,7 @@ A synthetic straddle replicates the payoff of being long both a call and a put â
 ### Execution Details
 
 - **Spot orders** use **GTC limit orders** posted at the bid/ask for **maker status** and trading rebates. Orders chase the book (cancel and re-post at updated bid/ask every 1 second) until filled.
-- **Option orders** use **GTC limit orders** posted at the bid (buy) / ask (sell) for **maker status** and trading rebates. Orders chase the book (cancel and re-post at updated bid/ask every 2 seconds) until filled.
+- **Option orders** use a **hybrid maker/taker** strategy: first 5 attempts post at the bid (buy) / ask (sell) for **maker rebates**; if not filled, remaining attempts escalate to the ask (buy) / bid (sell) to guarantee execution. Chase interval: 2 seconds.
 - A **pre-flight capital check** verifies sufficient funds for all legs (spot margin + put premiums with 5% slippage buffer) before placing any trades, preventing orphaned positions.
 
 ## Project Structure
