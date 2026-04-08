@@ -23,7 +23,7 @@ def record_trade(num_straddles: int) -> None:
     Per straddle:
       option_contracts = 4   (buy NUM_PUTS puts + sell NUM_PUTS puts, each QTY_PER_LEG BTC)
       option_btc       = 2 × QTY_PER_LEG × NUM_PUTS  (buy + sell sides)
-      perp_btc         = 2 × QTY_PER_LEG              (buy + sell sides)
+      spot_btc         = 2 × QTY_PER_LEG              (buy + sell sides)
     """
     contracts_per = 2 * config.NUM_PUTS
     option_btc_per = 2 * config.QTY_PER_LEG * config.NUM_PUTS

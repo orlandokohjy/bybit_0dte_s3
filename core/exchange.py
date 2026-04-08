@@ -1,7 +1,7 @@
 """
 Bybit V5 API wrapper — REST + WebSocket.
 
-Handles spot margin orders (with leverage), option orders (aggressive limit chase),
+Handles spot margin orders (with leverage), option orders (GTC limit for maker rebate),
 and market data.
 """
 from __future__ import annotations
@@ -450,16 +450,20 @@ class BybitExchange:
             log.debug("cancel_order_failed", symbol=symbol, order_id=order_id, exc_info=True)
 
     async def chase_buy_put(
-        self, symbol: str, qty: float, initial_ask: float,
+        self, symbol: str, qty: float, initial_bid: float,
     ) -> dict | None:
         """
         Maker buy: GTC limit at bid, chase the bid until filled.
 
         Posts at the current bid price for maker rebate. If not filled
         within the chase interval, cancels and re-posts at the updated bid.
+
+        Args:
+            initial_bid: REST-snapshot bid price, used as fallback when
+                         the option WebSocket hasn't delivered data yet.
         """
         if config.DRY_RUN:
-            return self._fake_order("Buy", symbol, qty, _round_price_up(initial_ask))
+            return self._fake_order("Buy", symbol, qty, _round_price_up(initial_bid))
 
         log.info("chase_buy_put_maker", symbol=symbol, qty=qty)
 
@@ -468,7 +472,7 @@ class BybitExchange:
             if cached and cached.bid > 0:
                 price = _round_price_up(cached.bid)
             else:
-                price = _round_price_up(initial_ask)
+                price = _round_price_up(initial_bid)
 
             result = await self._place_option_limit("Buy", symbol, qty, price)
             order_id = result.get("orderId", "")
@@ -489,16 +493,20 @@ class BybitExchange:
         return None
 
     async def chase_sell_put(
-        self, symbol: str, qty: float, initial_bid: float,
+        self, symbol: str, qty: float, initial_ask: float,
     ) -> dict | None:
         """
         Maker sell: GTC limit at ask, chase the ask until filled.
 
         Posts at the current ask price for maker rebate. If not filled
         within the chase interval, cancels and re-posts at the updated ask.
+
+        Args:
+            initial_ask: REST-snapshot ask price, used as fallback when
+                         the option WebSocket hasn't delivered data yet.
         """
         if config.DRY_RUN:
-            return self._fake_order("Sell", symbol, qty, _round_price_down(initial_bid))
+            return self._fake_order("Sell", symbol, qty, _round_price_down(initial_ask))
 
         log.info("chase_sell_put_maker", symbol=symbol, qty=qty)
 
@@ -507,7 +515,7 @@ class BybitExchange:
             if cached and cached.ask > 0:
                 price = _round_price_down(cached.ask)
             else:
-                price = _round_price_down(initial_bid)
+                price = _round_price_down(initial_ask)
 
             result = await self._place_option_limit("Sell", symbol, qty, price, reduce=True)
             order_id = result.get("orderId", "")

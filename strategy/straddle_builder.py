@@ -8,6 +8,7 @@ Exit  : spot first (GTC limit at ask — maker) → puts (GTC limit at ask — m
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Optional
 
@@ -66,12 +67,15 @@ async def build_straddle(
         order_id=spot_order_id, avg_fill_price=spot_fill,
     )
 
-    # ── Step 2: Buy NUM_PUTS put legs (nearest ITM) ──
-    put_ask = put.ask
-    if put_ask <= 0:
-        _, put_ask = await market.get_option_bid_ask(put.symbol)
-    if put_ask <= 0:
-        log.error("put_no_ask", id=straddle_id, symbol=put.symbol)
+    # ── Step 2: Subscribe option WS + Buy NUM_PUTS put legs (nearest ITM) ──
+    market.subscribe_option(put.symbol)
+    await asyncio.sleep(1)  # brief wait for first WS tick
+
+    put_bid = put.bid
+    if put_bid <= 0:
+        put_bid, _ = await market.get_option_bid_ask(put.symbol)
+    if put_bid <= 0:
+        log.error("put_no_bid", id=straddle_id, symbol=put.symbol)
         await _emergency_sell_spot(exchange, total_spot_qty)
         return None
 
@@ -79,18 +83,18 @@ async def build_straddle(
     total_put_qty = config.QTY_PER_LEG * num_straddles
 
     for i in range(config.NUM_PUTS):
-        result = await exchange.chase_buy_put(put.symbol, total_put_qty, put_ask)
+        result = await exchange.chase_buy_put(put.symbol, total_put_qty, put_bid)
         if result is None:
             log.error("put_buy_failed", id=straddle_id, leg=i + 1, symbol=put.symbol)
             # Unwind spot + any puts already bought
             await _emergency_sell_spot(exchange, total_spot_qty)
             for pl in put_legs:
-                bid, _ = await market.get_option_bid_ask(put.symbol)
-                if bid > 0:
-                    await exchange.chase_sell_put(put.symbol, pl.qty, bid)
+                _, ask = await market.get_option_bid_ask(put.symbol)
+                if ask > 0:
+                    await exchange.chase_sell_put(put.symbol, pl.qty, ask)
             return None
 
-        fill_price = float(result.get("avgPrice", put_ask))
+        fill_price = float(result.get("avgPrice", put_bid))
         put_legs.append(StraddleLeg(
             instrument=put.symbol, side="Buy",
             qty=total_put_qty, entry_price=fill_price,
@@ -98,10 +102,7 @@ async def build_straddle(
         ))
         log.info("put_filled", id=straddle_id, leg=i + 1, price=fill_price)
 
-    # ── Step 3: Subscribe to option ticker ──
-    market.subscribe_option(put.symbol)
-
-    # ── Step 4: Register ──
+    # ── Step 3: Register ──
     avg_put_price = sum(p.avg_fill_price for p in put_legs) / len(put_legs)
     total_put_cost = config.NUM_PUTS * config.QTY_PER_LEG * avg_put_price
     straddle_cost = (config.QTY_PER_LEG * spot_fill / config.SPOT_LEVERAGE) + total_put_cost
@@ -154,22 +155,22 @@ async def unwind_straddle(
 
     exit_spot = await market.get_spot_price()
 
-    # ── Sell all put legs ──
+    # ── Sell all put legs (GTC limit at ask — maker) ──
     exit_put_price = 0.0
     put_prices: list[float] = []
     for pl in straddle.put_legs:
-        bid, _ = await market.get_option_bid_ask(pl.instrument)
-        if bid > 0:
-            result = await exchange.chase_sell_put(pl.instrument, pl.qty, bid)
+        _, ask = await market.get_option_bid_ask(pl.instrument)
+        if ask > 0:
+            result = await exchange.chase_sell_put(pl.instrument, pl.qty, ask)
             if result:
-                price = float(result.get("avgPrice", bid))
+                price = float(result.get("avgPrice", ask))
                 put_prices.append(price)
                 log.info("put_sold", instrument=pl.instrument, price=price)
             else:
                 log.warning("put_sell_failed", instrument=pl.instrument)
                 put_prices.append(0.0)
         else:
-            log.warning("put_no_bid", instrument=pl.instrument)
+            log.warning("put_no_ask", instrument=pl.instrument)
             put_prices.append(0.0)
 
     exit_put_price = sum(put_prices) / len(put_prices) if put_prices else 0.0

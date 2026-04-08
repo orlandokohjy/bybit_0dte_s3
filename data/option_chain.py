@@ -66,7 +66,7 @@ class OptionChain:
                 continue
 
             # Only use USDT-settled options (5-part symbols ending in "USDT")
-            # so that premium and P&L are in USDT, matching the perp leg.
+            # so that premium and P&L are in USDT, matching the spot leg.
             is_usdt_settled = len(parts) == 5 and parts[4] == "USDT"
             if not is_usdt_settled:
                 continue
