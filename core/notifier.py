@@ -1,4 +1,9 @@
-"""Telegram notification helper."""
+"""Telegram notification helper.
+
+Two channels:
+  - Ops chat (TELEGRAM_CHAT_ID): startup, pre-flight, entry, close, errors
+  - Report chat (TELEGRAM_REPORT_CHAT_ID): slim daily report only
+"""
 from __future__ import annotations
 
 import asyncio
@@ -20,21 +25,33 @@ def _url() -> str | None:
     return _BASE_URL
 
 
-async def send(text: str) -> None:
-    if not config.TELEGRAM_ENABLED:
-        log.debug("telegram_disabled", msg=text[:80])
+async def _send_to(chat_id: str, text: str) -> None:
+    """Send a message to a specific chat ID."""
+    if not config.TELEGRAM_ENABLED or not chat_id:
+        log.debug("telegram_disabled", chat_id=chat_id, msg=text[:80])
         return
     try:
         import aiohttp
         url = f"{_url()}/sendMessage"
         async with aiohttp.ClientSession() as session:
             await session.post(url, json={
-                "chat_id": config.TELEGRAM_CHAT_ID,
+                "chat_id": chat_id,
                 "text": text,
                 "parse_mode": "HTML",
             })
     except Exception:
-        log.warning("telegram_send_failed", exc_info=True)
+        log.warning("telegram_send_failed", chat_id=chat_id, exc_info=True)
+
+
+async def send(text: str) -> None:
+    """Send to the ops/testing chat."""
+    await _send_to(config.TELEGRAM_CHAT_ID, text)
+
+
+async def send_report(text: str) -> None:
+    """Send to the report group chat. Falls back to ops chat if not configured."""
+    chat_id = config.TELEGRAM_REPORT_CHAT_ID or config.TELEGRAM_CHAT_ID
+    await _send_to(chat_id, text)
 
 
 async def notify_entry(
@@ -75,14 +92,14 @@ async def notify_daily_summary(equity: float, daily_pnl: float, cum_return: floa
 
 
 async def send_daily_report(equity: float) -> None:
-    """Generate and send the slim Trade Summary report."""
+    """Generate and send the slim Trade Summary to the report group chat."""
     from reporting.daily_report import compute_report, format_telegram_summary
     try:
         metrics = compute_report(equity)
         if metrics is None:
             log.info("daily_report_skipped", reason="no trades in log")
             return
-        await send(format_telegram_summary(metrics))
+        await send_report(format_telegram_summary(metrics))
         log.info("daily_report_sent", trades=metrics.total_trades, sharpe=f"{metrics.sharpe_ratio:.2f}")
     except Exception:
         log.warning("daily_report_failed", exc_info=True)
