@@ -30,8 +30,9 @@ lines.append("BYBIT_TESTNET=false")
 lines.append("BYBIT_DEMO=false")
 lines.append("DRY_RUN=false")
 if cfg.has_section("telegram"):
-    lines.append(f"TELEGRAM_BOT_TOKEN={cfg.get('telegram', 'bot_token', fallback='')}")
+    lines.append(f"TELEGRAM_BOT_TOKEN={cfg.get('telegram', 'ops_bot_token', fallback=cfg.get('telegram', 'bot_token', fallback=''))}")
     lines.append(f"TELEGRAM_CHAT_ID={cfg.get('telegram', 'ops_chat_id', fallback=cfg.get('telegram', 'chat_id', fallback=''))}")
+    lines.append(f"TELEGRAM_REPORT_BOT_TOKEN={cfg.get('telegram', 'bot_token', fallback='')}")
     lines.append(f"TELEGRAM_REPORT_CHAT_ID={cfg.get('telegram', 'chat_id', fallback='')}")
 lines.append("LOG_LEVEL=INFO")
 with open(".env", "w") as f:

@@ -15,24 +15,14 @@ import config
 
 log = structlog.get_logger(__name__)
 
-_BASE_URL: Optional[str] = None
-
-
-def _url() -> str | None:
-    global _BASE_URL
-    if _BASE_URL is None and config.TELEGRAM_ENABLED:
-        _BASE_URL = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}"
-    return _BASE_URL
-
-
-async def _send_to(chat_id: str, text: str) -> None:
-    """Send a message to a specific chat ID."""
-    if not config.TELEGRAM_ENABLED or not chat_id:
+async def _send_to(bot_token: str, chat_id: str, text: str) -> None:
+    """Send a message using a specific bot token and chat ID."""
+    if not bot_token or not chat_id:
         log.debug("telegram_disabled", chat_id=chat_id, msg=text[:80])
         return
     try:
         import aiohttp
-        url = f"{_url()}/sendMessage"
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         async with aiohttp.ClientSession() as session:
             await session.post(url, json={
                 "chat_id": chat_id,
@@ -44,14 +34,15 @@ async def _send_to(chat_id: str, text: str) -> None:
 
 
 async def send(text: str) -> None:
-    """Send to the ops/testing chat."""
-    await _send_to(config.TELEGRAM_CHAT_ID, text)
+    """Send to the ops/testing chat (personal bot)."""
+    await _send_to(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID, text)
 
 
 async def send_report(text: str) -> None:
-    """Send to the report group chat. Falls back to ops chat if not configured."""
-    chat_id = config.TELEGRAM_REPORT_CHAT_ID or config.TELEGRAM_CHAT_ID
-    await _send_to(chat_id, text)
+    """Send to the report group chat (group bot). Falls back to ops if not configured."""
+    bot = config.TELEGRAM_REPORT_BOT_TOKEN or config.TELEGRAM_BOT_TOKEN
+    chat = config.TELEGRAM_REPORT_CHAT_ID or config.TELEGRAM_CHAT_ID
+    await _send_to(bot, chat, text)
 
 
 async def notify_entry(
