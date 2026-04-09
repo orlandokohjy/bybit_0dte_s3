@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INITIAL_CAPITAL="${INITIAL_CAPITAL:-7900}"
+INITIAL_CAPITAL="${INITIAL_CAPITAL:-8000}"
 STRAT_CONFIG="${STRAT_CONFIG:-$HOME/strat_config.ini}"
 
 echo "Pulling latest code..."
