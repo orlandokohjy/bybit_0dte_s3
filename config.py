@@ -39,7 +39,7 @@ NUM_PUTS: int = 2               # put contracts per straddle (2 × 0.5 BTC)
 
 # ─────────────────────────── Sizing (Compound) ──────────────────
 
-INITIAL_CAPITAL_USD: float = 8_000.0
+INITIAL_CAPITAL_USD: float = 7_900.0
 ALLOC_PCT: float = 0.60        # 60 % of current equity
 
 # ──────────────────────── Option Filters ─────────────────────────
