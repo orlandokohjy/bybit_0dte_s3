@@ -8,6 +8,7 @@ Compound sizing: 60 % of current equity, no cap on straddles.
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 
@@ -91,6 +92,10 @@ class Algo:
         for job_id, ft in fire_times.items():
             if ft:
                 log.info("next_fire", job=job_id, time=format_utc_sgt(ft))
+
+        if os.getenv("ENTRY_NOW", "").lower() == "true":
+            log.info("immediate_entry_triggered")
+            await self._on_entry()
 
         log.info("algo_running")
         await self._shutdown.wait()
