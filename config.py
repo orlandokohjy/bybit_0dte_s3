@@ -60,7 +60,7 @@ ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri
 # ──────────────────── Execution Settings ─────────────────────────
 
 # Spot: GTC limit orders at bid/ask for maker rebate
-SPOT_CHASE_INTERVAL_SEC: float = 1.0
+SPOT_CHASE_INTERVAL_SEC: float = 3.0
 SPOT_CHASE_MAX_ATTEMPTS: int = 15
 SPOT_TICK_SIZE: float = 0.10       # BTCUSDT spot tick size on Bybit
 

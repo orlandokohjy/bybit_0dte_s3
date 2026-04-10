@@ -49,6 +49,7 @@ class BybitExchange:
 
     MAX_RETRIES = 3
     RETRY_DELAY = 1.0
+    NON_RETRYABLE_CODES = {"170131", "170210", "110001"}
 
     def __init__(self) -> None:
         self._http = HTTP(
@@ -88,6 +89,10 @@ class BybitExchange:
             except Exception as exc:
                 self._error_count += 1
                 last_exc = exc
+                err_str = str(exc)
+                if any(f"ErrCode: {code}" in err_str for code in self.NON_RETRYABLE_CODES):
+                    log.error("api_non_retryable", error=err_str)
+                    raise
                 log.warning("api_retry", attempt=attempt + 1, error=str(exc))
                 if attempt < self.MAX_RETRIES - 1:
                     await asyncio.sleep(self.RETRY_DELAY * (attempt + 1))
@@ -258,7 +263,6 @@ class BybitExchange:
         """
         deadline = _time.time() + timeout
         while _time.time() < deadline:
-            # Check open orders
             try:
                 data = await self._call(
                     self._http.get_open_orders,
@@ -271,14 +275,13 @@ class BybitExchange:
                     status = open_list[0].get("orderStatus")
                     if status == "Filled":
                         return open_list[0]
-                    if status == "New":
+                    if status in ("New", "PartiallyFilled"):
                         await asyncio.sleep(0.5)
                         continue
                     return {}
             except Exception:
                 pass
 
-            # Not in open orders — check history
             try:
                 data = await self._call(
                     self._http.get_order_history,
@@ -296,12 +299,29 @@ class BybitExchange:
 
         return {}
 
+    async def _get_order_final_state(self, category: str, symbol: str, order_id: str) -> dict:
+        """Query order history for the final state after a cancel attempt."""
+        await asyncio.sleep(0.3)
+        try:
+            data = await self._call(
+                self._http.get_order_history,
+                category=category, symbol=symbol, orderId=order_id,
+            )
+            hist = data["result"]["list"]
+            if hist:
+                return hist[0]
+        except Exception:
+            pass
+        return {}
+
     async def buy_spot(self, qty: float) -> dict:
         """
         Limit buy BTC spot with margin — post at bid for maker rebate.
 
         Uses GTC limit at bid price. If not filled within the chase interval,
-        cancels and re-posts at the updated bid.
+        cancels and re-posts at the updated bid.  After every cancel, the
+        order's final state is verified to prevent duplicate orders when a
+        fill arrives between the timeout and the cancel.
         """
         log.info("buy_spot_maker", qty=qty)
         if config.DRY_RUN:
@@ -327,8 +347,20 @@ class BybitExchange:
                 log.info("spot_buy_filled", price=fill_price, attempt=attempt + 1)
                 return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
 
-            # Not filled — cancel and retry at new bid
             await self.cancel_order(config.SPOT_CATEGORY, config.SPOT_SYMBOL, order_id)
+
+            final = await self._get_order_final_state(
+                config.SPOT_CATEGORY, config.SPOT_SYMBOL, order_id,
+            )
+            final_status = final.get("orderStatus", "")
+            cum_qty = float(final.get("cumExecQty", 0))
+            if cum_qty > 0:
+                fill_price = float(final.get("avgPrice", price))
+                log.info("spot_buy_filled_post_cancel", price=fill_price,
+                         qty_filled=cum_qty, status=final_status, attempt=attempt + 1)
+                return {"orderId": order_id, "orderStatus": "Filled",
+                        "avgPrice": str(fill_price), "cumExecQty": str(cum_qty)}
+
             log.debug("spot_buy_chase", attempt=attempt + 1, price=price)
 
         log.warning("spot_buy_chase_exhausted", qty=qty)
@@ -339,7 +371,8 @@ class BybitExchange:
         Limit sell BTC spot — post at ask for maker rebate.
 
         Uses GTC limit at ask price. If not filled within the chase interval,
-        cancels and re-posts at the updated ask.
+        cancels and re-posts at the updated ask.  Post-cancel verification
+        prevents duplicate sells when a fill races with the timeout.
         """
         log.info("sell_spot_maker", qty=qty)
         if config.DRY_RUN:
@@ -366,6 +399,19 @@ class BybitExchange:
                 return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
 
             await self.cancel_order(config.SPOT_CATEGORY, config.SPOT_SYMBOL, order_id)
+
+            final = await self._get_order_final_state(
+                config.SPOT_CATEGORY, config.SPOT_SYMBOL, order_id,
+            )
+            final_status = final.get("orderStatus", "")
+            cum_qty = float(final.get("cumExecQty", 0))
+            if cum_qty > 0:
+                fill_price = float(final.get("avgPrice", price))
+                log.info("spot_sell_filled_post_cancel", price=fill_price,
+                         qty_filled=cum_qty, status=final_status, attempt=attempt + 1)
+                return {"orderId": order_id, "orderStatus": "Filled",
+                        "avgPrice": str(fill_price), "cumExecQty": str(cum_qty)}
+
             log.debug("spot_sell_chase", attempt=attempt + 1, price=price)
 
         log.warning("spot_sell_chase_exhausted", qty=qty)
@@ -404,7 +450,7 @@ class BybitExchange:
                     status = open_list[0].get("orderStatus")
                     if status == "Filled":
                         return open_list[0]
-                    if status == "New":
+                    if status in ("New", "PartiallyFilled"):
                         await asyncio.sleep(0.5)
                         continue
                     return {}
@@ -495,6 +541,15 @@ class BybitExchange:
                 return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
 
             await self.cancel_order("option", symbol, order_id)
+
+            final = await self._get_order_final_state("option", symbol, order_id)
+            cum_qty = float(final.get("cumExecQty", 0))
+            if cum_qty > 0:
+                fill_price = float(final.get("avgPrice", price))
+                log.info("chase_filled_post_cancel", symbol=symbol, price=fill_price,
+                         qty_filled=cum_qty, attempt=attempt + 1)
+                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+
             log.debug("chase_buy_reprice", symbol=symbol, attempt=attempt + 1, price=price)
 
         log.warning("chase_exhausted", symbol=symbol)
@@ -546,6 +601,15 @@ class BybitExchange:
                 return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
 
             await self.cancel_order("option", symbol, order_id)
+
+            final = await self._get_order_final_state("option", symbol, order_id)
+            cum_qty = float(final.get("cumExecQty", 0))
+            if cum_qty > 0:
+                fill_price = float(final.get("avgPrice", price))
+                log.info("chase_sell_filled_post_cancel", symbol=symbol, price=fill_price,
+                         qty_filled=cum_qty, attempt=attempt + 1)
+                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+
             log.debug("chase_sell_reprice", symbol=symbol, attempt=attempt + 1, price=price)
 
         log.warning("chase_sell_exhausted", symbol=symbol)
