@@ -94,6 +94,10 @@ class DailyMetrics:
     daily_vol: float             # stdev of daily returns
     annualised_vol: float
 
+    # Option premium (today's trade)
+    put_premium_entry: float
+    put_premium_exit: float
+
     # Capital / Margin (today's trade)
     spot_margin_used: float
     put_premium_cost: float
@@ -264,6 +268,8 @@ def compute_report(equity: float) -> Optional[DailyMetrics]:
         expectancy_ratio=expectancy_ratio,
         daily_vol=daily_vol,
         annualised_vol=ann_vol,
+        put_premium_entry=latest.put_premium_entry,
+        put_premium_exit=latest.put_premium_exit,
         spot_margin_used=latest.spot_margin_used,
         put_premium_cost=latest.put_premium_cost,
         total_capital_used=latest.total_capital_used,
@@ -300,6 +306,7 @@ def format_telegram_report(m: DailyMetrics) -> str:
         "<b>Today's Trade</b>",
         f"  P&L: {pnl_sign}${m.trade_pnl:,.2f} ({pnl_sign}{m.trade_return_pct:.2%})",
         f"  Spot: ${m.spot_entry:,.0f} → ${m.spot_exit:,.0f} ({m.spot_move_pct:+.2%})",
+        f"  Option: ${m.put_premium_entry:,.2f} → ${m.put_premium_exit:,.2f}",
         f"  Put strike: ${m.put_strike:,.0f}",
         f"  Straddles: {m.num_straddles}",
         "",
@@ -372,6 +379,8 @@ def format_telegram_summary(m: DailyMetrics) -> str:
         "",
         "<b>Today's Trade</b>",
         f"  P&L: {pnl_sign}${m.trade_pnl:,.2f} ({pnl_sign}{m.trade_return_pct:.2%})",
+        f"  Spot: ${m.spot_entry:,.0f} → ${m.spot_exit:,.0f}",
+        f"  Option: ${m.put_premium_entry:,.2f} → ${m.put_premium_exit:,.2f}",
         f"  Equity: ${m.equity:,.2f}",
         "",
         "<b>Volume</b>",
