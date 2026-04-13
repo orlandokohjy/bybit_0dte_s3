@@ -548,14 +548,6 @@ def format_weekly_report(m: DailyMetrics) -> str:
         f"  Straddles: {m.num_straddles}",
         f"  Spot: {spot_btc:.1f} BTC / ${spot_usd:,.0f}",
         f"  Options: {put_btc:.1f} BTC / ${option_usd:,.0f}",
-        "",
-        "<b>Risk</b>",
-        f"  Best trade: +${m.best_trade:,.2f}" if m.best_trade >= 0 else f"  Best trade: ${m.best_trade:,.2f}",
-        f"  Worst trade: ${m.worst_trade:,.2f}",
-        f"  Win rate: {m.win_rate:.0%}",
-        f"  Profit factor: {m.profit_factor:.2f}",
-        f"  Weekly Sharpe: {m.sharpe_ratio:.2f}",
-        f"  Max DD (week): {m.max_drawdown_pct:.2%}",
     ]
 
     return "\n".join(lines)
