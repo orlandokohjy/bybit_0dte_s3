@@ -52,6 +52,7 @@ MIN_OPEN_INTEREST: float = 0.0
 SESSION_ENTRY_UTC: time = time(14, 0)
 SESSION_CLOSE_UTC: time = time(18, 0)
 REPORT_UTC: time = time(19, 0)
+WEEKLY_REPORT_UTC: time = time(20, 0)
 ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri
 
 # ───────────────────── Exit ───────────────────────────────────────

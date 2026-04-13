@@ -85,6 +85,7 @@ class Algo:
             on_entry=self._on_entry,
             on_close=self._on_close,
             on_report=self._on_report,
+            on_weekly_report=self._on_weekly_report,
         )
         self.scheduler.start()
 
@@ -230,6 +231,15 @@ class Algo:
         except Exception:
             log.error("report_error", exc_info=True)
             await notifier.notify_error("Report", "Daily report failed — check logs")
+
+    # ──────────────────── Weekly Report (Fri 20:00 UTC) ─────────
+
+    async def _on_weekly_report(self) -> None:
+        try:
+            await notifier.send_weekly_report(self.portfolio.equity)
+        except Exception:
+            log.error("weekly_report_error", exc_info=True)
+            await notifier.notify_error("Weekly Report", "Weekly report failed — check logs")
 
     # ──────────────────── Shutdown ────────────────────────────────
 

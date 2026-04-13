@@ -1,8 +1,9 @@
 """
-Daily performance report — generated after the 18:00 UTC hard close.
+Daily and weekly performance reports.
 
-Reads the trade log CSV, computes quant metrics over the full history,
-and formats a Telegram-ready HTML report.
+Reads the trade log CSV, computes quant metrics over the full history
+(daily) or the current ISO week (weekly), and formats Telegram-ready
+HTML reports.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import csv
 import math
 import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Optional
 
 import structlog
@@ -397,6 +399,163 @@ def format_telegram_summary(m: DailyMetrics) -> str:
         f"    Spot: ${exit_spot_usd:,.0f}",
         f"    Options: ${exit_put_usd:,.0f}",
         f"    Total: {total_btc:.1f} BTC / ${exit_total_usd:,.0f}",
+    ]
+
+    return "\n".join(lines)
+
+
+# ═══════════════════════ Weekly Report ═══════════════════════════════
+
+def _monday_of_week(date_str: str) -> str:
+    """Return the ISO Monday (YYYY-MM-DD) for a given trade date string."""
+    dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+    monday = dt - timedelta(days=dt.weekday())
+    return monday.strftime("%Y-%m-%d")
+
+
+def compute_weekly_report(equity: float) -> Optional[DailyMetrics]:
+    """Compute a report scoped to the current ISO week (Mon-Fri)."""
+    all_trades = _load_trades()
+    if not all_trades:
+        return None
+
+    today = datetime.utcnow()
+    week_monday = today - timedelta(days=today.weekday())
+    week_start = week_monday.strftime("%Y-%m-%d")
+
+    trades = [t for t in all_trades if _monday_of_week(t.date) == week_start]
+    if not trades:
+        return None
+
+    pnls = [t.net_pnl for t in trades]
+    returns = [t.net_pnl / t.capital_before if t.capital_before > 0 else 0.0 for t in trades]
+
+    equity_start = trades[0].capital_before
+    equities = [equity_start]
+    for t in trades:
+        equities.append(t.capital_after)
+
+    wins = [p for p in pnls if p >= 0]
+    losses = [p for p in pnls if p < 0]
+    n_wins = len(wins)
+    n_losses = len(losses)
+    total = len(trades)
+
+    win_rate = n_wins / total if total > 0 else 0.0
+    avg_win = sum(wins) / n_wins if n_wins > 0 else 0.0
+    avg_loss = sum(losses) / n_losses if n_losses > 0 else 0.0
+
+    gross_wins = sum(wins)
+    gross_losses = abs(sum(losses))
+    profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
+
+    current_streak, max_win_streak, max_loss_streak = _compute_streaks(pnls)
+    max_dd, current_dd, hwm = _compute_drawdown_series(equities)
+
+    mean_ret = sum(returns) / len(returns) if returns else 0.0
+    daily_vol = (sum((r - mean_ret) ** 2 for r in returns) / len(returns)) ** 0.5 if len(returns) > 1 else 0.0
+    ann_vol = daily_vol * math.sqrt(TRADING_DAYS_PER_YEAR)
+
+    sharpe = ((mean_ret / daily_vol * math.sqrt(TRADING_DAYS_PER_YEAR))
+              if daily_vol > 0 else 0.0)
+
+    downside_returns = [r for r in returns if r < 0]
+    downside_vol = ((sum(r ** 2 for r in downside_returns) / len(downside_returns)) ** 0.5
+                    if downside_returns else 0.0)
+    sortino = ((mean_ret / downside_vol * math.sqrt(TRADING_DAYS_PER_YEAR))
+               if downside_vol > 0 else 0.0)
+
+    weekly_return = sum(pnls) / equity_start if equity_start > 0 else 0.0
+    calmar = (weekly_return * 52) / max_dd if max_dd > 0 else 0.0
+
+    expectancy = sum(pnls) / total if total > 0 else 0.0
+    expectancy_ratio = expectancy / abs(avg_loss) if avg_loss != 0 else 0.0
+
+    latest = trades[-1]
+    cum_return = (equity - config.INITIAL_CAPITAL_USD) / config.INITIAL_CAPITAL_USD
+
+    total_straddles = sum(t.num_straddles for t in trades)
+    avg_spot_entry = sum(t.spot_entry * t.num_straddles for t in trades) / total_straddles if total_straddles else 0
+    avg_spot_exit = sum(t.spot_exit * t.num_straddles for t in trades) / total_straddles if total_straddles else 0
+    avg_put_entry = sum(t.put_premium_entry * t.num_straddles for t in trades) / total_straddles if total_straddles else 0
+    avg_put_exit = sum(t.put_premium_exit * t.num_straddles for t in trades) / total_straddles if total_straddles else 0
+
+    return DailyMetrics(
+        trade_date=week_start,
+        trade_pnl=sum(pnls),
+        trade_return_pct=weekly_return,
+        spot_entry=avg_spot_entry,
+        spot_exit=avg_spot_exit,
+        spot_move_pct=(avg_spot_exit - avg_spot_entry) / avg_spot_entry if avg_spot_entry else 0,
+        num_straddles=total_straddles,
+        equity=equity,
+        initial_capital=config.INITIAL_CAPITAL_USD,
+        total_trades=total,
+        total_pnl=sum(pnls),
+        cumulative_return_pct=cum_return,
+        wins=n_wins,
+        losses=n_losses,
+        win_rate=win_rate,
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        profit_factor=profit_factor,
+        best_trade=max(pnls) if pnls else 0.0,
+        worst_trade=min(pnls) if pnls else 0.0,
+        current_streak=current_streak,
+        max_win_streak=max_win_streak,
+        max_loss_streak=max_loss_streak,
+        sharpe_ratio=sharpe,
+        sortino_ratio=sortino,
+        calmar_ratio=calmar,
+        max_drawdown_pct=max_dd,
+        current_drawdown_pct=current_dd,
+        high_water_mark=hwm,
+        expectancy=expectancy,
+        expectancy_ratio=expectancy_ratio,
+        daily_vol=daily_vol,
+        annualised_vol=ann_vol,
+        put_premium_entry=avg_put_entry,
+        put_premium_exit=avg_put_exit,
+        spot_margin_used=sum(t.spot_margin_used for t in trades),
+        put_premium_cost=sum(t.put_premium_cost for t in trades),
+        total_capital_used=sum(t.total_capital_used for t in trades),
+        put_strike=latest.put_strike,
+    )
+
+
+def format_weekly_report(m: DailyMetrics) -> str:
+    """Format weekly metrics into a Telegram HTML message for the group chat."""
+
+    pnl_sign = "+" if m.trade_pnl >= 0 else ""
+
+    spot_btc = config.QTY_PER_LEG * m.num_straddles
+    num_puts = config.NUM_PUTS * m.num_straddles
+    put_btc = config.QTY_PER_LEG * num_puts
+    total_btc = spot_btc + put_btc
+
+    spot_usd = spot_btc * m.spot_entry if m.spot_entry else 0
+    option_usd = put_btc * m.spot_entry if m.spot_entry else 0
+
+    lines = [
+        f"<b>WEEKLY REPORT — Week of {m.trade_date}</b>",
+        "",
+        f"  Weekly P&L: {pnl_sign}${m.trade_pnl:,.2f} ({pnl_sign}{m.trade_return_pct:.2%})",
+        f"  Trades: {m.total_trades} ({m.wins}W / {m.losses}L)",
+        f"  Equity: ${m.equity:,.2f}",
+        f"  Cumulative: {m.cumulative_return_pct:+.1%}",
+        "",
+        "<b>Volume (this week)</b>",
+        f"  Straddles: {m.num_straddles}",
+        f"  Spot: {spot_btc:.1f} BTC / ${spot_usd:,.0f}",
+        f"  Options: {put_btc:.1f} BTC / ${option_usd:,.0f}",
+        "",
+        "<b>Risk</b>",
+        f"  Best trade: +${m.best_trade:,.2f}" if m.best_trade >= 0 else f"  Best trade: ${m.best_trade:,.2f}",
+        f"  Worst trade: ${m.worst_trade:,.2f}",
+        f"  Win rate: {m.win_rate:.0%}",
+        f"  Profit factor: {m.profit_factor:.2f}",
+        f"  Weekly Sharpe: {m.sharpe_ratio:.2f}",
+        f"  Max DD (week): {m.max_drawdown_pct:.2%}",
     ]
 
     return "\n".join(lines)

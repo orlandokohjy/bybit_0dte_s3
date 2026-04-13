@@ -20,6 +20,7 @@ class Scheduler:
 
     def register_session(
         self, on_entry: callable, on_close: callable, on_report: callable,
+        on_weekly_report: callable | None = None,
     ) -> None:
         weekdays = ",".join(
             ["mon", "tue", "wed", "thu", "fri"][d] for d in sorted(config.ALLOWED_WEEKDAYS)
@@ -61,11 +62,25 @@ class Scheduler:
             replace_existing=True,
         )
 
+        if on_weekly_report is not None:
+            weekly_t = config.WEEKLY_REPORT_UTC
+            self._scheduler.add_job(
+                on_weekly_report,
+                CronTrigger(
+                    hour=weekly_t.hour, minute=weekly_t.minute,
+                    day_of_week="fri", timezone=UTC,
+                ),
+                id="weekly_report",
+                name=f"Weekly Report (Fri {weekly_t.hour:02d}:{weekly_t.minute:02d} UTC)",
+                replace_existing=True,
+            )
+
         log.info(
             "session_scheduled",
             entry=f"{entry_t.hour:02d}:{entry_t.minute:02d} UTC",
             close=f"{close_t.hour:02d}:{close_t.minute:02d} UTC",
             report=f"{report_t.hour:02d}:{report_t.minute:02d} UTC",
+            weekly_report=f"Fri {config.WEEKLY_REPORT_UTC.hour:02d}:{config.WEEKLY_REPORT_UTC.minute:02d} UTC",
             days=weekdays,
         )
 

@@ -94,3 +94,17 @@ async def send_daily_report(equity: float) -> None:
         log.info("daily_report_sent", trades=metrics.total_trades, sharpe=f"{metrics.sharpe_ratio:.2f}")
     except Exception:
         log.warning("daily_report_failed", exc_info=True)
+
+
+async def send_weekly_report(equity: float) -> None:
+    """Generate and send the weekly report to the report group chat."""
+    from reporting.daily_report import compute_weekly_report, format_weekly_report
+    try:
+        metrics = compute_weekly_report(equity)
+        if metrics is None:
+            log.info("weekly_report_skipped", reason="no trades this week")
+            return
+        await send_report(format_weekly_report(metrics))
+        log.info("weekly_report_sent", trades=metrics.total_trades, pnl=f"${metrics.trade_pnl:,.2f}")
+    except Exception:
+        log.warning("weekly_report_failed", exc_info=True)
