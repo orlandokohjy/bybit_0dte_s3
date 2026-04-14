@@ -212,10 +212,11 @@ class Algo:
     async def _on_close(self) -> None:
         try:
             pnl = await self.exit_mgr.hard_close()
-            cum_return = (self.portfolio.equity - config.INITIAL_CAPITAL_USD) / config.INITIAL_CAPITAL_USD
-            await notifier.notify_daily_summary(
-                self.portfolio.equity, self.portfolio.daily_pnl, cum_return,
-            )
+            if self.portfolio.daily_pnl != 0.0:
+                cum_return = (self.portfolio.equity - config.INITIAL_CAPITAL_USD) / config.INITIAL_CAPITAL_USD
+                await notifier.notify_daily_summary(
+                    self.portfolio.equity, self.portfolio.daily_pnl, cum_return,
+                )
             self.portfolio.reset_daily()
             log.info("session_close_done", pnl=f"${pnl:,.2f}",
                      equity=f"${self.portfolio.equity:,.2f}")

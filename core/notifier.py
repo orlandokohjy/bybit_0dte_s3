@@ -59,9 +59,10 @@ async def notify_entry(
 
 
 async def notify_close(pnl: float, exit_reason: str) -> None:
+    pnl_sign = "+" if pnl >= 0 else ""
     await send(
-        f"<b>SESSION CLOSE</b> ({exit_reason})\n"
-        f"P&L: ${pnl:,.2f}\n"
+        f"<b>SESSION CLOSE</b>\n"
+        f"P&L: {pnl_sign}${pnl:,.2f}\n"
     )
 
 

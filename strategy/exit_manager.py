@@ -36,5 +36,5 @@ class ExitManager:
             self._exchange, self._market, self._portfolio,
             reason="hard_close",
         )
-        await notifier.notify_close(pnl, "hard_close")
+        await notifier.notify_close(pnl, "session_close")
         return pnl
