@@ -177,12 +177,15 @@ def _compute_streaks(pnls: list[float]) -> tuple[int, int, int]:
 
 
 def compute_report(equity: float) -> Optional[DailyMetrics]:
-    """Compute the full daily report from the trade log."""
+    """Compute the full daily report from the trade log. Returns None if no trade today."""
     trades = _load_trades()
     if not trades:
         return None
 
     latest = trades[-1]
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    if latest.date[:10] != today_str:
+        return None
     pnls = [t.net_pnl for t in trades]
     returns = [t.net_pnl / t.capital_before if t.capital_before > 0 else 0.0 for t in trades]
     equities = [config.INITIAL_CAPITAL_USD]
