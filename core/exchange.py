@@ -251,8 +251,7 @@ class BybitExchange:
             timeInForce="GTC",
             marketUnit="baseCoin",
         )
-        if side == "Buy":
-            params["isLeverage"] = 1
+        params["isLeverage"] = 1
         data = await self._call(self._http.place_order, **params)
         return data["result"]
 
