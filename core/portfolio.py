@@ -112,6 +112,17 @@ class Portfolio:
     def equity(self) -> float:
         return self._equity
 
+    def sync_equity(self, live_equity: float) -> None:
+        """Sync internal equity with the live Bybit wallet balance."""
+        if live_equity <= 0:
+            log.warning("sync_equity_skipped", live_equity=live_equity)
+            return
+        old = self._equity
+        self._equity = live_equity
+        self._save_equity()
+        log.info("equity_synced", old=f"${old:,.2f}", live=f"${live_equity:,.2f}",
+                 delta=f"${live_equity - old:,.2f}")
+
     @property
     def daily_pnl(self) -> float:
         return self._daily_pnl

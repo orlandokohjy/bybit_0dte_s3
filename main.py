@@ -3,7 +3,7 @@ Bybit 0DTE BTC Synthetic Straddle — Session 3 Only.
 
 Single daily session: 14:00–18:00 UTC, Mon–Fri.
 Position: 0.5 BTC spot (margin) + 2 × 0.5 BTC ITM puts per straddle.
-Compound sizing: 60 % of current equity, no cap on straddles.
+Compound sizing: 80 % of current equity, no cap on straddles.
 """
 from __future__ import annotations
 
@@ -63,6 +63,11 @@ class Algo:
         margin_mode = await self.exchange.get_margin_mode()
         await self.market.start()
         spot = await self.market.get_spot_price()
+
+        if not config.DRY_RUN:
+            live_equity = await self.exchange.get_total_equity_usd()
+            if live_equity > 0:
+                self.portfolio.sync_equity(live_equity)
 
         log.info("algo_initialized",
                  spot=f"${spot:,.2f}",
@@ -144,7 +149,12 @@ class Algo:
             await notifier.notify_skip(f"No ITM put near spot ${spot:,.0f}")
             return
 
-        # ── Pre-flight sizing: compute full capital requirement before any trades ──
+        # ── Sync equity from live wallet before sizing ──
+        if not config.DRY_RUN:
+            live_equity = await self.exchange.get_total_equity_usd()
+            if live_equity > 0:
+                self.portfolio.sync_equity(live_equity)
+
         equity = self.portfolio.equity
         sizing = size_position(equity, spot, put.ask)
 
@@ -218,14 +228,23 @@ class Algo:
 
     async def _on_close(self) -> None:
         try:
+            equity_before = self.portfolio.equity
             pnl = await self.exit_mgr.hard_close()
-            if self.portfolio.daily_pnl != 0.0:
+
+            if not config.DRY_RUN:
+                live_equity = await self.exchange.get_total_equity_usd()
+                if live_equity > 0:
+                    self.portfolio.sync_equity(live_equity)
+
+            actual_pnl = self.portfolio.equity - equity_before
+            if actual_pnl != 0.0:
                 cum_return = (self.portfolio.equity - config.INITIAL_CAPITAL_USD) / config.INITIAL_CAPITAL_USD
                 await notifier.notify_daily_summary(
-                    self.portfolio.equity, self.portfolio.daily_pnl, cum_return,
+                    self.portfolio.equity, actual_pnl, cum_return,
                 )
             self.portfolio.reset_daily()
             log.info("session_close_done", pnl=f"${pnl:,.2f}",
+                     actual_pnl=f"${actual_pnl:,.2f}",
                      equity=f"${self.portfolio.equity:,.2f}")
         except Exception:
             log.error("close_error", exc_info=True)
