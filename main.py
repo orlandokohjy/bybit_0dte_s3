@@ -201,7 +201,14 @@ class Algo:
         if straddle:
             volume_tracker.record_trade(sizing.num_straddles)
             await notifier.notify_entry(
-                sizing.num_straddles, equity, sizing.straddle_cost, spot, put.strike,
+                num_straddles=sizing.num_straddles,
+                equity=equity,
+                straddle_cost=sizing.straddle_cost,
+                spot_fill=straddle.entry_spot,
+                strike=put.strike,
+                put_premium=straddle.entry_put_price,
+                spot_margin_used=straddle.entry_spot * config.QTY_PER_LEG / config.SPOT_LEVERAGE,
+                put_cost_total=straddle.total_put_cost,
             )
             log.info("session_entry_done", num_straddles=sizing.num_straddles)
         else:

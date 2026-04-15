@@ -46,15 +46,22 @@ async def send_report(text: str) -> None:
 
 
 async def notify_entry(
-    num_straddles: int, equity: float, straddle_cost: float, spot: float, strike: float,
+    num_straddles: int, equity: float, straddle_cost: float,
+    spot_fill: float, strike: float, put_premium: float,
+    spot_margin_used: float, put_cost_total: float,
 ) -> None:
     await send(
         f"<b>SESSION ENTRY</b>\n"
         f"Straddles: {num_straddles}\n"
         f"Equity: ${equity:,.2f}\n"
-        f"Straddle cost: ${straddle_cost:,.2f}\n"
-        f"Spot: ${spot:,.2f}\n"
+        f"\n<b>Fills</b>\n"
+        f"Spot: ${spot_fill:,.2f}\n"
         f"Put strike: ${strike:,.0f}\n"
+        f"Put premium (avg): ${put_premium:,.2f}\n"
+        f"\n<b>Capital used</b>\n"
+        f"Spot margin: ${spot_margin_used:,.2f}\n"
+        f"Put cost: ${put_cost_total:,.2f}\n"
+        f"Total: ${spot_margin_used + put_cost_total:,.2f}\n"
     )
 
 
