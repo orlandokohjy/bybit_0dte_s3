@@ -551,7 +551,27 @@ class BybitExchange:
 
             log.debug("chase_buy_reprice", symbol=symbol, attempt=attempt + 1, price=price)
 
-        log.warning("chase_exhausted", symbol=symbol)
+        # ── Taker fallback: place one final order at ask to guarantee fill ──
+        log.warning("chase_maker_exhausted_trying_taker", symbol=symbol)
+        cached = self.get_cached_option(symbol)
+        taker_price = _round_price_up(cached.ask if cached and cached.ask > 0 else initial_bid + tick * 20)
+        result = await self._place_option_limit("Buy", symbol, qty, taker_price)
+        order_id = result.get("orderId", "")
+        if order_id:
+            fill = await self._wait_option_fill(symbol, order_id, timeout=10.0)
+            if fill and fill.get("orderStatus") == "Filled":
+                fill_price = float(fill.get("avgPrice", taker_price))
+                log.info("chase_taker_filled", symbol=symbol, price=fill_price)
+                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+            await self.cancel_order("option", symbol, order_id)
+            final = await self._get_order_final_state("option", symbol, order_id)
+            cum_qty = float(final.get("cumExecQty", 0))
+            if cum_qty > 0:
+                fill_price = float(final.get("avgPrice", taker_price))
+                log.info("chase_taker_filled_post_cancel", symbol=symbol, price=fill_price)
+                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+
+        log.warning("chase_exhausted_including_taker", symbol=symbol)
         return None
 
     async def chase_sell_put(
@@ -611,7 +631,27 @@ class BybitExchange:
 
             log.debug("chase_sell_reprice", symbol=symbol, attempt=attempt + 1, price=price)
 
-        log.warning("chase_sell_exhausted", symbol=symbol)
+        # ── Taker fallback: place one final order at bid to guarantee fill ──
+        log.warning("chase_sell_maker_exhausted_trying_taker", symbol=symbol)
+        cached = self.get_cached_option(symbol)
+        taker_price = _round_price_down(cached.bid if cached and cached.bid > 0 else initial_ask - tick * 20)
+        result = await self._place_option_limit("Sell", symbol, qty, taker_price, reduce=True)
+        order_id = result.get("orderId", "")
+        if order_id:
+            fill = await self._wait_option_fill(symbol, order_id, timeout=10.0)
+            if fill and fill.get("orderStatus") == "Filled":
+                fill_price = float(fill.get("avgPrice", taker_price))
+                log.info("chase_sell_taker_filled", symbol=symbol, price=fill_price)
+                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+            await self.cancel_order("option", symbol, order_id)
+            final = await self._get_order_final_state("option", symbol, order_id)
+            cum_qty = float(final.get("cumExecQty", 0))
+            if cum_qty > 0:
+                fill_price = float(final.get("avgPrice", taker_price))
+                log.info("chase_sell_taker_filled_post_cancel", symbol=symbol, price=fill_price)
+                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+
+        log.warning("chase_sell_exhausted_including_taker", symbol=symbol)
         return None
 
     # ─────────────────── WebSocket Streams ───────────────────────
