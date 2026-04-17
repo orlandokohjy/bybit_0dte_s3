@@ -68,6 +68,7 @@ SPOT_TICK_SIZE: float = 0.10       # BTCUSDT spot tick size on Bybit
 # Options: GTC limit — escalating maker (bid → ask-1tick, never cross spread)
 OPTION_CHASE_INTERVAL_SEC: float = 3.0
 OPTION_CHASE_MAX_ATTEMPTS: int = 50
+OPTION_CHASE_DEADLINE_SEC: float = 300.0   # 5 min total chase time before giving up
 OPTION_TICK_SIZE: float = 5.0
 
 # ──────────────────── Risk Management ────────────────────────────

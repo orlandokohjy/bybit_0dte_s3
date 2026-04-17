@@ -123,6 +123,12 @@ class Portfolio:
         log.info("equity_synced", old=f"${old:,.2f}", live=f"${live_equity:,.2f}",
                  delta=f"${live_equity - old:,.2f}")
 
+    def adjust_equity(self, delta: float) -> None:
+        """Apply an equity adjustment (e.g. emergency unwind P&L) and persist."""
+        self._equity += delta
+        self._daily_pnl += delta
+        self._save_equity()
+
     @property
     def daily_pnl(self) -> float:
         return self._daily_pnl

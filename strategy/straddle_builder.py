@@ -9,6 +9,8 @@ Exit  : spot first (GTC limit at ask — maker) → puts (GTC limit at ask — m
 from __future__ import annotations
 
 import asyncio
+import csv
+import os
 import uuid
 from typing import Optional
 
@@ -16,7 +18,7 @@ import structlog
 
 import config
 from core.exchange import BybitExchange
-from core.portfolio import Portfolio, Straddle, StraddleLeg
+from core.portfolio import Portfolio, Straddle, StraddleLeg, TRADE_LOG_FIELDS
 from data.market_data import MarketData
 from data.option_chain import OptionInfo
 from utils.time_utils import now_utc
@@ -69,14 +71,16 @@ async def build_straddle(
 
     # ── Step 2: Subscribe option WS + Buy NUM_PUTS put legs (nearest ITM) ──
     market.subscribe_option(put.symbol)
-    await asyncio.sleep(1)  # brief wait for first WS tick
+    await asyncio.sleep(1)
 
     put_bid = put.bid
     if put_bid <= 0:
         put_bid, _ = await market.get_option_bid_ask(put.symbol)
     if put_bid <= 0:
         log.error("put_no_bid", id=straddle_id, symbol=put.symbol)
-        await _emergency_sell_spot(exchange, total_spot_qty)
+        await _emergency_unwind_all(
+            exchange, market, portfolio, put.symbol,
+            spot_fill, total_spot_qty, [], straddle_id)
         return None
 
     put_legs: list[StraddleLeg] = []
@@ -85,13 +89,11 @@ async def build_straddle(
     for i in range(config.NUM_PUTS):
         result = await exchange.chase_buy_put(put.symbol, total_put_qty, put_bid)
         if result is None:
-            log.error("put_buy_failed", id=straddle_id, leg=i + 1, symbol=put.symbol)
-            # Unwind spot + any puts already bought
-            await _emergency_sell_spot(exchange, total_spot_qty)
-            for pl in put_legs:
-                _, ask = await market.get_option_bid_ask(put.symbol)
-                if ask > 0:
-                    await exchange.chase_sell_put(put.symbol, pl.qty, ask)
+            log.error("put_chase_deadline_expired", id=straddle_id,
+                      leg=i + 1, symbol=put.symbol)
+            await _emergency_unwind_all(
+                exchange, market, portfolio, put.symbol,
+                spot_fill, total_spot_qty, put_legs, straddle_id)
             return None
 
         fill_price = float(result.get("avgPrice", put_bid))
@@ -181,9 +183,163 @@ async def unwind_straddle(
     return pnl
 
 
-async def _emergency_sell_spot(exchange: BybitExchange, qty: float) -> None:
+async def _emergency_unwind_all(
+    exchange: BybitExchange,
+    market: MarketData,
+    portfolio: Portfolio,
+    put_symbol: str,
+    spot_entry_price: float,
+    spot_qty: float,
+    filled_put_legs: list[StraddleLeg],
+    straddle_id: str,
+) -> None:
+    """
+    Comprehensive emergency unwind after a put chase deadline expires.
+
+    1. Query Bybit for actual held put position (catches orphaned partial fills)
+    2. Sell all held puts
+    3. Sell spot
+    4. Log the emergency P&L to trade_log.csv
+    5. Send Telegram alert
+    """
+    from core import notifier
+
+    log.warning("emergency_unwind_start", id=straddle_id,
+                spot_qty=spot_qty, known_put_legs=len(filled_put_legs))
+
+    entry_time = now_utc().isoformat()
+    total_put_pnl = 0.0
+    total_put_entry_cost = 0.0
+
+    # ── 1. Query actual put position from Bybit ──
+    actual_put_qty = await exchange.get_option_position(put_symbol)
+    log.info("emergency_actual_put_position", symbol=put_symbol, qty=actual_put_qty)
+
+    # ── 2. Sell all held puts ──
+    put_exit_price = 0.0
+    if actual_put_qty > 0:
+        _, ask = await market.get_option_bid_ask(put_symbol)
+        if ask > 0:
+            result = await exchange.chase_sell_put(put_symbol, actual_put_qty, ask)
+            if result:
+                put_exit_price = float(result.get("avgPrice", ask))
+                log.info("emergency_puts_sold", symbol=put_symbol,
+                         qty=actual_put_qty, price=put_exit_price)
+            else:
+                log.error("emergency_put_sell_chase_failed", symbol=put_symbol)
+        else:
+            log.warning("emergency_put_no_ask", symbol=put_symbol)
+
+        avg_put_entry = (
+            sum(p.avg_fill_price for p in filled_put_legs) / len(filled_put_legs)
+            if filled_put_legs else 0.0)
+        total_put_entry_cost = avg_put_entry * actual_put_qty
+        total_put_pnl = (put_exit_price - avg_put_entry) * actual_put_qty
+
+    # ── 3. Sell spot ──
+    spot_exit_price = 0.0
+    spot_pnl = 0.0
     try:
-        await exchange.sell_spot(qty)
-        log.info("emergency_spot_sold", qty=qty)
+        sell_result = await exchange.sell_spot(spot_qty)
+        if sell_result and sell_result.get("orderId"):
+            spot_exit_price = float(sell_result.get("avgPrice", 0))
+            if spot_exit_price <= 0:
+                spot_exit_price = await market.get_spot_price()
+            log.info("emergency_spot_sold", qty=spot_qty, price=spot_exit_price)
+        else:
+            spot_exit_price = await market.get_spot_price()
+            log.error("emergency_spot_sell_chase_failed", qty=spot_qty)
     except Exception:
-        log.error("emergency_spot_sell_failed", qty=qty, exc_info=True)
+        spot_exit_price = await market.get_spot_price()
+        log.error("emergency_spot_sell_failed", qty=spot_qty, exc_info=True)
+
+    spot_pnl = (spot_exit_price - spot_entry_price) * spot_qty
+    net_pnl = spot_pnl + total_put_pnl
+
+    # ── 4. Log to trade_log.csv ──
+    _log_emergency_trade(
+        portfolio=portfolio,
+        entry_time=entry_time,
+        spot_entry=spot_entry_price,
+        spot_exit=spot_exit_price,
+        spot_qty=spot_qty,
+        put_entry_price=total_put_entry_cost / actual_put_qty if actual_put_qty > 0 else 0,
+        put_exit_price=put_exit_price,
+        spot_pnl=spot_pnl,
+        put_pnl=total_put_pnl,
+        net_pnl=net_pnl,
+    )
+
+    # ── 5. Telegram alert ──
+    pnl_sign = "+" if net_pnl >= 0 else ""
+    await notifier.send(
+        f"<b>EMERGENCY UNWIND</b> [{straddle_id}]\n"
+        f"Put chase deadline expired ({config.OPTION_CHASE_DEADLINE_SEC:.0f}s)\n"
+        f"\n<b>Spot</b>\n"
+        f"  Entry: ${spot_entry_price:,.2f} → Exit: ${spot_exit_price:,.2f}\n"
+        f"  P&L: ${spot_pnl:,.2f}\n"
+        f"\n<b>Puts ({put_symbol})</b>\n"
+        f"  Qty held: {actual_put_qty}\n"
+        f"  Exit price: ${put_exit_price:,.2f}\n"
+        f"  P&L: ${total_put_pnl:,.2f}\n"
+        f"\n<b>Net P&L: {pnl_sign}${net_pnl:,.2f}</b>"
+    )
+
+    log.warning("emergency_unwind_done", id=straddle_id,
+                spot_pnl=f"${spot_pnl:,.2f}",
+                put_pnl=f"${total_put_pnl:,.2f}",
+                net_pnl=f"${net_pnl:,.2f}",
+                actual_put_qty=actual_put_qty)
+
+
+def _log_emergency_trade(
+    portfolio: Portfolio,
+    entry_time: str,
+    spot_entry: float,
+    spot_exit: float,
+    spot_qty: float,
+    put_entry_price: float,
+    put_exit_price: float,
+    spot_pnl: float,
+    put_pnl: float,
+    net_pnl: float,
+) -> None:
+    """Write a row to trade_log.csv for the emergency unwind."""
+    equity_before = portfolio.equity
+    portfolio.adjust_equity(net_pnl)
+    equity_after = portfolio.equity
+
+    row = {
+        "date": entry_time[:10],
+        "entry_time": entry_time,
+        "exit_time": now_utc().isoformat(),
+        "exit_reason": "emergency_unwind",
+        "num_straddles": 0,
+        "spot_entry": spot_entry,
+        "spot_exit": spot_exit,
+        "put_strike": 0,
+        "put_premium_entry": put_entry_price,
+        "put_premium_exit": put_exit_price,
+        "spot_margin_used": round(spot_qty * spot_entry / config.SPOT_LEVERAGE, 2),
+        "put_premium_cost": 0,
+        "total_capital_used": 0,
+        "straddle_cost": 0,
+        "capital_before": equity_before,
+        "spot_pnl": round(spot_pnl, 2),
+        "put_pnl": round(put_pnl, 2),
+        "gross_pnl": round(net_pnl, 2),
+        "fees": 0.0,
+        "net_pnl": round(net_pnl, 2),
+        "capital_after": equity_after,
+    }
+
+    os.makedirs(config.STATE_DIR, exist_ok=True)
+    needs_header = not os.path.exists(config.TRADE_LOG_FILE)
+    with open(config.TRADE_LOG_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+    log.info("emergency_trade_logged", net_pnl=f"${net_pnl:,.2f}",
+             equity_after=f"${equity_after:,.2f}")

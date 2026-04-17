@@ -223,6 +223,19 @@ class BybitExchange:
                 return float(equity)
         return 0.0
 
+    async def get_option_position(self, symbol: str) -> float:
+        """Query actual held qty for an option symbol. Returns 0 if none."""
+        try:
+            data = await self._call(
+                self._http.get_positions, category="option", symbol=symbol)
+            for pos in data.get("result", {}).get("list", []):
+                size = float(pos.get("size", 0))
+                if size > 0:
+                    return size
+        except Exception:
+            log.warning("get_option_position_failed", symbol=symbol, exc_info=True)
+        return 0.0
+
     # ──────────────────── Order Helpers ───────────────────────────
 
     def _fake_order(self, side: str, symbol: str, qty: float, price: float) -> dict:
@@ -498,11 +511,13 @@ class BybitExchange:
         self, symbol: str, qty: float, initial_bid: float,
     ) -> dict | None:
         """
-        Escalating maker buy: start at bid, walk up by 1 tick per attempt.
+        Time-based persistent maker buy with escalating price.
 
-        Never crosses the spread (price capped at ask - 1 tick), so every
-        order is a maker order.  On each attempt the price improves by one
-        option tick ($5) to attract a fill.
+        Runs in cycles until a 5-minute deadline (OPTION_CHASE_DEADLINE_SEC):
+          1. Escalate from bid to ask-1tick over OPTION_CHASE_MAX_ATTEMPTS steps
+          2. Try one taker order at the ask
+          3. If still unfilled, reset to bid and start a new cycle
+          4. After deadline, return None
 
         Args:
             initial_bid: REST-snapshot bid price, used as starting price
@@ -511,67 +526,98 @@ class BybitExchange:
         if config.DRY_RUN:
             return self._fake_order("Buy", symbol, qty, _round_price_up(initial_bid))
 
-        log.info("chase_buy_put_maker", symbol=symbol, qty=qty)
+        deadline = _time.time() + config.OPTION_CHASE_DEADLINE_SEC
         tick = config.OPTION_TICK_SIZE
+        cycle = 0
+        total_attempts = 0
 
-        for attempt in range(config.OPTION_CHASE_MAX_ATTEMPTS):
-            cached = self.get_cached_option(symbol)
+        log.info("chase_buy_put_start", symbol=symbol, qty=qty,
+                 deadline_sec=config.OPTION_CHASE_DEADLINE_SEC)
 
-            if cached and cached.bid > 0:
-                base_price = cached.bid
-                ceiling = cached.ask - tick if cached.ask > 0 else cached.bid + tick * 10
-            else:
-                base_price = initial_bid
-                ceiling = initial_bid + tick * 10
+        while _time.time() < deadline:
+            cycle += 1
+            log.info("chase_buy_cycle", symbol=symbol, cycle=cycle,
+                     remaining_sec=int(deadline - _time.time()))
 
-            price = _round_price_up(base_price + tick * attempt)
-            price = min(price, _round_price_up(ceiling))
+            # ── Maker escalation: bid → ask-1tick ──
+            for step in range(config.OPTION_CHASE_MAX_ATTEMPTS):
+                if _time.time() >= deadline:
+                    break
 
-            result = await self._place_option_limit("Buy", symbol, qty, price)
-            order_id = result.get("orderId", "")
-            if not order_id:
-                break
+                total_attempts += 1
+                cached = self.get_cached_option(symbol)
 
-            fill = await self._wait_option_fill(symbol, order_id, timeout=config.OPTION_CHASE_INTERVAL_SEC)
+                if cached and cached.bid > 0:
+                    base_price = cached.bid
+                    ceiling = cached.ask - tick if cached.ask > 0 else cached.bid + tick * 10
+                else:
+                    base_price = initial_bid
+                    ceiling = initial_bid + tick * 10
 
-            if fill and fill.get("orderStatus") == "Filled":
-                fill_price = float(fill.get("avgPrice", price))
-                log.info("chase_filled", symbol=symbol, price=fill_price, attempt=attempt + 1)
-                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+                price = _round_price_up(base_price + tick * step)
+                price = min(price, _round_price_up(ceiling))
 
-            await self.cancel_order("option", symbol, order_id)
+                result = await self._place_option_limit("Buy", symbol, qty, price)
+                order_id = result.get("orderId", "")
+                if not order_id:
+                    await asyncio.sleep(1)
+                    continue
 
-            final = await self._get_order_final_state("option", symbol, order_id)
-            cum_qty = float(final.get("cumExecQty", 0))
-            if cum_qty > 0:
-                fill_price = float(final.get("avgPrice", price))
-                log.info("chase_filled_post_cancel", symbol=symbol, price=fill_price,
-                         qty_filled=cum_qty, attempt=attempt + 1)
-                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+                fill = await self._wait_option_fill(
+                    symbol, order_id, timeout=config.OPTION_CHASE_INTERVAL_SEC)
 
-            log.debug("chase_buy_reprice", symbol=symbol, attempt=attempt + 1, price=price)
+                if fill and fill.get("orderStatus") == "Filled":
+                    fill_price = float(fill.get("avgPrice", price))
+                    log.info("chase_filled", symbol=symbol, price=fill_price,
+                             attempt=total_attempts, cycle=cycle)
+                    return {"orderId": order_id, "orderStatus": "Filled",
+                            "avgPrice": str(fill_price)}
 
-        # ── Taker fallback: place one final order at ask to guarantee fill ──
-        log.warning("chase_maker_exhausted_trying_taker", symbol=symbol)
-        cached = self.get_cached_option(symbol)
-        taker_price = _round_price_up(cached.ask if cached and cached.ask > 0 else initial_bid + tick * 20)
-        result = await self._place_option_limit("Buy", symbol, qty, taker_price)
-        order_id = result.get("orderId", "")
-        if order_id:
-            fill = await self._wait_option_fill(symbol, order_id, timeout=10.0)
-            if fill and fill.get("orderStatus") == "Filled":
-                fill_price = float(fill.get("avgPrice", taker_price))
-                log.info("chase_taker_filled", symbol=symbol, price=fill_price)
-                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
-            await self.cancel_order("option", symbol, order_id)
-            final = await self._get_order_final_state("option", symbol, order_id)
-            cum_qty = float(final.get("cumExecQty", 0))
-            if cum_qty > 0:
-                fill_price = float(final.get("avgPrice", taker_price))
-                log.info("chase_taker_filled_post_cancel", symbol=symbol, price=fill_price)
-                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+                await self.cancel_order("option", symbol, order_id)
 
-        log.warning("chase_exhausted_including_taker", symbol=symbol)
+                final = await self._get_order_final_state("option", symbol, order_id)
+                cum_qty = float(final.get("cumExecQty", 0))
+                if cum_qty > 0:
+                    fill_price = float(final.get("avgPrice", price))
+                    log.info("chase_filled_post_cancel", symbol=symbol,
+                             price=fill_price, qty_filled=cum_qty,
+                             attempt=total_attempts, cycle=cycle)
+                    return {"orderId": order_id, "orderStatus": "Filled",
+                            "avgPrice": str(fill_price)}
+
+                log.debug("chase_buy_reprice", symbol=symbol,
+                          attempt=total_attempts, cycle=cycle, price=price)
+
+            # ── Taker attempt at end of each cycle ──
+            if _time.time() < deadline:
+                log.warning("chase_cycle_taker_attempt", symbol=symbol, cycle=cycle)
+                cached = self.get_cached_option(symbol)
+                taker_price = _round_price_up(
+                    cached.ask if cached and cached.ask > 0
+                    else initial_bid + tick * 20)
+                result = await self._place_option_limit("Buy", symbol, qty, taker_price)
+                order_id = result.get("orderId", "")
+                if order_id:
+                    fill = await self._wait_option_fill(symbol, order_id, timeout=10.0)
+                    if fill and fill.get("orderStatus") == "Filled":
+                        fill_price = float(fill.get("avgPrice", taker_price))
+                        log.info("chase_taker_filled", symbol=symbol,
+                                 price=fill_price, cycle=cycle)
+                        return {"orderId": order_id, "orderStatus": "Filled",
+                                "avgPrice": str(fill_price)}
+                    await self.cancel_order("option", symbol, order_id)
+                    final = await self._get_order_final_state("option", symbol, order_id)
+                    cum_qty = float(final.get("cumExecQty", 0))
+                    if cum_qty > 0:
+                        fill_price = float(final.get("avgPrice", taker_price))
+                        log.info("chase_taker_filled_post_cancel", symbol=symbol,
+                                 price=fill_price, cycle=cycle)
+                        return {"orderId": order_id, "orderStatus": "Filled",
+                                "avgPrice": str(fill_price)}
+
+        log.warning("chase_deadline_expired", symbol=symbol,
+                    total_attempts=total_attempts, cycles=cycle,
+                    deadline_sec=config.OPTION_CHASE_DEADLINE_SEC)
         return None
 
     async def chase_sell_put(
