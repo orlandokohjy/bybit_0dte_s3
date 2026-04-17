@@ -168,6 +168,18 @@ async def unwind_straddle(
                 price = float(result.get("avgPrice", ask))
                 put_prices.append(price)
                 log.info("put_sold", instrument=pl.instrument, price=price)
+
+                remaining_pos = await exchange.get_option_position(pl.instrument)
+                if remaining_pos > 0:
+                    log.warning("put_position_remaining_after_sell",
+                                instrument=pl.instrument, remaining=remaining_pos)
+                    _, ask2 = await market.get_option_bid_ask(pl.instrument)
+                    if ask2 > 0:
+                        retry = await exchange.chase_sell_put(
+                            pl.instrument, remaining_pos, ask2)
+                        if retry:
+                            log.info("put_remaining_sold",
+                                     instrument=pl.instrument, qty=remaining_pos)
             else:
                 log.warning("put_sell_failed", instrument=pl.instrument)
                 put_prices.append(0.0)

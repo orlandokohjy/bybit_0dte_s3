@@ -519,6 +519,10 @@ class BybitExchange:
           3. If still unfilled, reset to bid and start a new cycle
           4. After deadline, return None
 
+        Partial fills are accumulated: if 0.23 of 0.5 fills, the chase
+        continues for the remaining 0.27 until the full qty is filled or
+        the deadline expires.
+
         Args:
             initial_bid: REST-snapshot bid price, used as starting price
                          when the option WebSocket hasn't delivered data yet.
@@ -530,18 +534,22 @@ class BybitExchange:
         tick = config.OPTION_TICK_SIZE
         cycle = 0
         total_attempts = 0
+        remaining_qty = qty
+        weighted_cost = 0.0
+        total_filled = 0.0
 
         log.info("chase_buy_put_start", symbol=symbol, qty=qty,
                  deadline_sec=config.OPTION_CHASE_DEADLINE_SEC)
 
-        while _time.time() < deadline:
+        while _time.time() < deadline and remaining_qty > 0:
             cycle += 1
             log.info("chase_buy_cycle", symbol=symbol, cycle=cycle,
+                     remaining_qty=remaining_qty,
                      remaining_sec=int(deadline - _time.time()))
 
             # ── Maker escalation: bid → ask-1tick ──
             for step in range(config.OPTION_CHASE_MAX_ATTEMPTS):
-                if _time.time() >= deadline:
+                if _time.time() >= deadline or remaining_qty <= 0:
                     break
 
                 total_attempts += 1
@@ -557,7 +565,7 @@ class BybitExchange:
                 price = _round_price_up(base_price + tick * step)
                 price = min(price, _round_price_up(ceiling))
 
-                result = await self._place_option_limit("Buy", symbol, qty, price)
+                result = await self._place_option_limit("Buy", symbol, remaining_qty, price)
                 order_id = result.get("orderId", "")
                 if not order_id:
                     await asyncio.sleep(1)
@@ -568,10 +576,15 @@ class BybitExchange:
 
                 if fill and fill.get("orderStatus") == "Filled":
                     fill_price = float(fill.get("avgPrice", price))
+                    weighted_cost += fill_price * remaining_qty
+                    total_filled += remaining_qty
+                    remaining_qty = 0.0
+                    avg_price = weighted_cost / total_filled
                     log.info("chase_filled", symbol=symbol, price=fill_price,
-                             attempt=total_attempts, cycle=cycle)
+                             total_filled=total_filled, attempt=total_attempts,
+                             cycle=cycle)
                     return {"orderId": order_id, "orderStatus": "Filled",
-                            "avgPrice": str(fill_price)}
+                            "avgPrice": str(avg_price)}
 
                 await self.cancel_order("option", symbol, order_id)
 
@@ -579,44 +592,75 @@ class BybitExchange:
                 cum_qty = float(final.get("cumExecQty", 0))
                 if cum_qty > 0:
                     fill_price = float(final.get("avgPrice", price))
-                    log.info("chase_filled_post_cancel", symbol=symbol,
-                             price=fill_price, qty_filled=cum_qty,
+                    weighted_cost += fill_price * cum_qty
+                    total_filled += cum_qty
+                    remaining_qty -= cum_qty
+                    remaining_qty = round(remaining_qty, 5)
+
+                    if remaining_qty <= 0:
+                        avg_price = weighted_cost / total_filled
+                        log.info("chase_filled_post_cancel", symbol=symbol,
+                                 price=fill_price, total_filled=total_filled,
+                                 attempt=total_attempts, cycle=cycle)
+                        return {"orderId": order_id, "orderStatus": "Filled",
+                                "avgPrice": str(avg_price)}
+
+                    log.info("chase_partial_fill", symbol=symbol,
+                             filled=cum_qty, remaining=remaining_qty,
                              attempt=total_attempts, cycle=cycle)
-                    return {"orderId": order_id, "orderStatus": "Filled",
-                            "avgPrice": str(fill_price)}
+                    break  # restart escalation from bid for remaining qty
 
                 log.debug("chase_buy_reprice", symbol=symbol,
                           attempt=total_attempts, cycle=cycle, price=price)
 
             # ── Taker attempt at end of each cycle ──
-            if _time.time() < deadline:
-                log.warning("chase_cycle_taker_attempt", symbol=symbol, cycle=cycle)
+            if _time.time() < deadline and remaining_qty > 0:
+                log.warning("chase_cycle_taker_attempt", symbol=symbol,
+                            cycle=cycle, remaining_qty=remaining_qty)
                 cached = self.get_cached_option(symbol)
                 taker_price = _round_price_up(
                     cached.ask if cached and cached.ask > 0
                     else initial_bid + tick * 20)
-                result = await self._place_option_limit("Buy", symbol, qty, taker_price)
+                result = await self._place_option_limit("Buy", symbol, remaining_qty, taker_price)
                 order_id = result.get("orderId", "")
                 if order_id:
                     fill = await self._wait_option_fill(symbol, order_id, timeout=10.0)
                     if fill and fill.get("orderStatus") == "Filled":
                         fill_price = float(fill.get("avgPrice", taker_price))
+                        weighted_cost += fill_price * remaining_qty
+                        total_filled += remaining_qty
+                        remaining_qty = 0.0
+                        avg_price = weighted_cost / total_filled
                         log.info("chase_taker_filled", symbol=symbol,
-                                 price=fill_price, cycle=cycle)
+                                 price=fill_price, total_filled=total_filled,
+                                 cycle=cycle)
                         return {"orderId": order_id, "orderStatus": "Filled",
-                                "avgPrice": str(fill_price)}
+                                "avgPrice": str(avg_price)}
                     await self.cancel_order("option", symbol, order_id)
                     final = await self._get_order_final_state("option", symbol, order_id)
                     cum_qty = float(final.get("cumExecQty", 0))
                     if cum_qty > 0:
                         fill_price = float(final.get("avgPrice", taker_price))
-                        log.info("chase_taker_filled_post_cancel", symbol=symbol,
-                                 price=fill_price, cycle=cycle)
-                        return {"orderId": order_id, "orderStatus": "Filled",
-                                "avgPrice": str(fill_price)}
+                        weighted_cost += fill_price * cum_qty
+                        total_filled += cum_qty
+                        remaining_qty -= cum_qty
+                        remaining_qty = round(remaining_qty, 5)
+
+                        if remaining_qty <= 0:
+                            avg_price = weighted_cost / total_filled
+                            log.info("chase_taker_filled_post_cancel",
+                                     symbol=symbol, price=fill_price,
+                                     total_filled=total_filled, cycle=cycle)
+                            return {"orderId": order_id, "orderStatus": "Filled",
+                                    "avgPrice": str(avg_price)}
+
+                        log.info("chase_taker_partial", symbol=symbol,
+                                 filled=cum_qty, remaining=remaining_qty,
+                                 cycle=cycle)
 
         log.warning("chase_deadline_expired", symbol=symbol,
                     total_attempts=total_attempts, cycles=cycle,
+                    total_filled=total_filled, remaining=remaining_qty,
                     deadline_sec=config.OPTION_CHASE_DEADLINE_SEC)
         return None
 
@@ -630,6 +674,9 @@ class BybitExchange:
         order is a maker order.  On each attempt the price improves by one
         option tick ($5) to attract a fill.
 
+        Partial fills are accumulated: if only part of the qty sells, the
+        chase continues for the remaining qty.
+
         Args:
             initial_ask: REST-snapshot ask price, used as starting price
                          when the option WebSocket hasn't delivered data yet.
@@ -639,8 +686,14 @@ class BybitExchange:
 
         log.info("chase_sell_put_maker", symbol=symbol, qty=qty)
         tick = config.OPTION_TICK_SIZE
+        remaining_qty = qty
+        weighted_revenue = 0.0
+        total_filled = 0.0
 
         for attempt in range(config.OPTION_CHASE_MAX_ATTEMPTS):
+            if remaining_qty <= 0:
+                break
+
             cached = self.get_cached_option(symbol)
 
             if cached and cached.ask > 0:
@@ -653,7 +706,7 @@ class BybitExchange:
             price = _round_price_down(base_price - tick * attempt)
             price = max(price, _round_price_down(floor))
 
-            result = await self._place_option_limit("Sell", symbol, qty, price, reduce=True)
+            result = await self._place_option_limit("Sell", symbol, remaining_qty, price, reduce=True)
             order_id = result.get("orderId", "")
             if not order_id:
                 break
@@ -662,8 +715,13 @@ class BybitExchange:
 
             if fill and fill.get("orderStatus") == "Filled":
                 fill_price = float(fill.get("avgPrice", price))
-                log.info("chase_sell_filled", symbol=symbol, price=fill_price, attempt=attempt + 1)
-                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+                weighted_revenue += fill_price * remaining_qty
+                total_filled += remaining_qty
+                remaining_qty = 0.0
+                avg_price = weighted_revenue / total_filled
+                log.info("chase_sell_filled", symbol=symbol, price=fill_price,
+                         total_filled=total_filled, attempt=attempt + 1)
+                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(avg_price)}
 
             await self.cancel_order("option", symbol, order_id)
 
@@ -671,31 +729,76 @@ class BybitExchange:
             cum_qty = float(final.get("cumExecQty", 0))
             if cum_qty > 0:
                 fill_price = float(final.get("avgPrice", price))
-                log.info("chase_sell_filled_post_cancel", symbol=symbol, price=fill_price,
-                         qty_filled=cum_qty, attempt=attempt + 1)
-                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+                weighted_revenue += fill_price * cum_qty
+                total_filled += cum_qty
+                remaining_qty -= cum_qty
+                remaining_qty = round(remaining_qty, 5)
 
-            log.debug("chase_sell_reprice", symbol=symbol, attempt=attempt + 1, price=price)
+                if remaining_qty <= 0:
+                    avg_price = weighted_revenue / total_filled
+                    log.info("chase_sell_filled_post_cancel", symbol=symbol,
+                             price=fill_price, total_filled=total_filled,
+                             attempt=attempt + 1)
+                    return {"orderId": order_id, "orderStatus": "Filled",
+                            "avgPrice": str(avg_price)}
+
+                log.info("chase_sell_partial_fill", symbol=symbol,
+                         filled=cum_qty, remaining=remaining_qty,
+                         attempt=attempt + 1)
+
+            log.debug("chase_sell_reprice", symbol=symbol, attempt=attempt + 1,
+                      remaining_qty=remaining_qty, price=price)
 
         # ── Taker fallback: place one final order at bid to guarantee fill ──
-        log.warning("chase_sell_maker_exhausted_trying_taker", symbol=symbol)
-        cached = self.get_cached_option(symbol)
-        taker_price = _round_price_down(cached.bid if cached and cached.bid > 0 else initial_ask - tick * 20)
-        result = await self._place_option_limit("Sell", symbol, qty, taker_price, reduce=True)
-        order_id = result.get("orderId", "")
-        if order_id:
-            fill = await self._wait_option_fill(symbol, order_id, timeout=10.0)
-            if fill and fill.get("orderStatus") == "Filled":
-                fill_price = float(fill.get("avgPrice", taker_price))
-                log.info("chase_sell_taker_filled", symbol=symbol, price=fill_price)
-                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
-            await self.cancel_order("option", symbol, order_id)
-            final = await self._get_order_final_state("option", symbol, order_id)
-            cum_qty = float(final.get("cumExecQty", 0))
-            if cum_qty > 0:
-                fill_price = float(final.get("avgPrice", taker_price))
-                log.info("chase_sell_taker_filled_post_cancel", symbol=symbol, price=fill_price)
-                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+        if remaining_qty > 0:
+            log.warning("chase_sell_maker_exhausted_trying_taker", symbol=symbol,
+                        remaining_qty=remaining_qty)
+            cached = self.get_cached_option(symbol)
+            taker_price = _round_price_down(
+                cached.bid if cached and cached.bid > 0
+                else initial_ask - tick * 20)
+            result = await self._place_option_limit("Sell", symbol, remaining_qty,
+                                                    taker_price, reduce=True)
+            order_id = result.get("orderId", "")
+            if order_id:
+                fill = await self._wait_option_fill(symbol, order_id, timeout=10.0)
+                if fill and fill.get("orderStatus") == "Filled":
+                    fill_price = float(fill.get("avgPrice", taker_price))
+                    weighted_revenue += fill_price * remaining_qty
+                    total_filled += remaining_qty
+                    remaining_qty = 0.0
+                    avg_price = weighted_revenue / total_filled
+                    log.info("chase_sell_taker_filled", symbol=symbol,
+                             price=fill_price, total_filled=total_filled)
+                    return {"orderId": order_id, "orderStatus": "Filled",
+                            "avgPrice": str(avg_price)}
+                await self.cancel_order("option", symbol, order_id)
+                final = await self._get_order_final_state("option", symbol, order_id)
+                cum_qty = float(final.get("cumExecQty", 0))
+                if cum_qty > 0:
+                    fill_price = float(final.get("avgPrice", taker_price))
+                    weighted_revenue += fill_price * cum_qty
+                    total_filled += cum_qty
+                    remaining_qty -= cum_qty
+                    remaining_qty = round(remaining_qty, 5)
+
+                    if remaining_qty <= 0:
+                        avg_price = weighted_revenue / total_filled
+                        log.info("chase_sell_taker_filled_post_cancel",
+                                 symbol=symbol, price=fill_price,
+                                 total_filled=total_filled)
+                        return {"orderId": order_id, "orderStatus": "Filled",
+                                "avgPrice": str(avg_price)}
+
+                    log.info("chase_sell_taker_partial", symbol=symbol,
+                             filled=cum_qty, remaining=remaining_qty)
+
+        if total_filled > 0:
+            avg_price = weighted_revenue / total_filled
+            log.warning("chase_sell_incomplete", symbol=symbol,
+                        total_filled=total_filled, remaining=remaining_qty)
+            return {"orderId": "partial", "orderStatus": "PartiallyFilled",
+                    "avgPrice": str(avg_price), "cumExecQty": str(total_filled)}
 
         log.warning("chase_sell_exhausted_including_taker", symbol=symbol)
         return None
