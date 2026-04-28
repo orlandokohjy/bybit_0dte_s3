@@ -65,10 +65,32 @@ SPOT_CHASE_INTERVAL_SEC: float = 3.0
 SPOT_CHASE_MAX_ATTEMPTS: int = 15
 SPOT_TICK_SIZE: float = 0.10       # BTCUSDT spot tick size on Bybit
 
-# Options: GTC limit — escalating maker (bid → ask-1tick, never cross spread)
+# Options: maker-only chase — 50% gap-narrowing toward ask + fair-value cap
+# (no taker fallback; bails on deadline → session is skipped)
 OPTION_CHASE_INTERVAL_SEC: float = 3.0
-OPTION_CHASE_MAX_ATTEMPTS: int = 50
-OPTION_CHASE_DEADLINE_SEC: float = 300.0   # 5 min total chase time before giving up
+OPTION_CHASE_MAX_ATTEMPTS: int = 50  # legacy, unused by new chase logic
+OPTION_CHASE_DEADLINE_SEC: float = float(
+    os.getenv("OPTION_CHASE_DEADLINE_SEC", "900.0")
+)  # 15 min total chase time before giving up
+
+# Each retry narrows the remaining bid-ask gap by this fraction.
+# 0.5 = halve the gap toward (ask − 1 tick).
+OPTION_CHASE_GAP_NARROW_PCT: float = float(
+    os.getenv("OPTION_CHASE_GAP_NARROW_PCT", "0.5")
+)
+
+# Hard ceiling on slippage vs mark price.
+# Buy will never post above mark × this; sell will never post below mark / this.
+OPTION_CHASE_MAX_SLIPPAGE_FACTOR: float = float(
+    os.getenv("OPTION_CHASE_MAX_SLIPPAGE_FACTOR", "1.15")
+)
+
+# Pre-entry spread sanity gate — skip session if put (ask − bid) / mid exceeds this.
+# 0.30 = skip if spread is wider than 30% of mid.
+OPTION_MAX_ENTRY_SPREAD_PCT: float = float(
+    os.getenv("OPTION_MAX_ENTRY_SPREAD_PCT", "0.30")
+)
+
 OPTION_TICK_SIZE: float = 5.0
 
 # ──────────────────── Risk Management ────────────────────────────
