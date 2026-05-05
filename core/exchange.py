@@ -251,6 +251,143 @@ class BybitExchange:
             log.warning("get_spot_balance_failed", coin=coin, exc_info=True)
         return 0.0
 
+    async def get_available_balance_usd(self, coin: str = "USDT") -> float:
+        """Return the available (free) balance in `coin` for the unified account.
+
+        Used for pre-entry collateral checks to ensure we have headroom for
+        the option premiums before placing any orders.
+        """
+        try:
+            data = await self._call(
+                self._http.get_wallet_balance,
+                accountType=config.ACCOUNT_TYPE,
+            )
+            for acct in data["result"]["list"]:
+                for c in acct.get("coin", []):
+                    if c.get("coin") == coin:
+                        avail = c.get("availableToWithdraw") or c.get("free") or 0
+                        return float(avail or 0)
+        except Exception:
+            log.warning("get_available_balance_failed", coin=coin, exc_info=True)
+        return 0.0
+
+    # ──────────────────── Open Orders & Positions (reconcile) ─────
+
+    async def list_open_orders(self) -> list[dict]:
+        """List all open option + spot orders on the unified account.
+
+        Returns a list of dicts with keys: category, symbol, orderId, side,
+        qty, price, orderStatus.  Used by the startup safeguards to clear
+        stale orders left from a previous run.
+        """
+        out: list[dict] = []
+        for category in ("option", "spot"):
+            try:
+                kwargs = {"category": category}
+                if category == "option":
+                    kwargs["baseCoin"] = config.BASE_COIN
+                data = await self._call(self._http.get_open_orders, **kwargs)
+                for o in data.get("result", {}).get("list", []) or []:
+                    out.append({
+                        "category": category,
+                        "symbol": o.get("symbol", ""),
+                        "orderId": o.get("orderId", ""),
+                        "side": o.get("side", ""),
+                        "qty": o.get("qty", ""),
+                        "price": o.get("price", ""),
+                        "orderStatus": o.get("orderStatus", ""),
+                    })
+            except Exception:
+                log.warning("list_open_orders_failed", category=category,
+                            exc_info=True)
+        return out
+
+    async def cancel_all_open_orders(self) -> int:
+        """Cancel every resting order across option + spot.
+
+        Returns the count cancelled. Stale orders eat margin and can cause
+        'Insufficient funds' errors on new entries (see 2026-04-20 incident
+        on Derive — same risk applies on Bybit).
+        """
+        orders = await self.list_open_orders()
+        if not orders:
+            log.info("cancel_all_no_open_orders")
+            return 0
+
+        log.warning("cancel_all_found_stale_orders", count=len(orders),
+                    orders=[f"{o['category']}/{o['symbol']} "
+                            f"{o['side']} {o['qty']}@{o['price']}"
+                            for o in orders])
+
+        cancelled = 0
+        for o in orders:
+            cat = o.get("category", "")
+            sym = o.get("symbol", "")
+            oid = o.get("orderId", "")
+            if not cat or not sym or not oid:
+                continue
+            try:
+                await self.cancel_order(cat, sym, oid)
+                cancelled += 1
+            except Exception:
+                log.warning("cancel_one_failed", category=cat, symbol=sym,
+                            order_id=oid, exc_info=True)
+        log.info("cancel_all_done", cancelled=cancelled,
+                 attempted=len(orders))
+        return cancelled
+
+    async def list_open_positions(self) -> list[dict]:
+        """List non-zero option positions + significant BTC spot holdings.
+
+        Returns dicts with keys:
+          category ('option' or 'spot'), symbol, amount (signed),
+          average_price, mark_price, unrealized_pnl
+        """
+        out: list[dict] = []
+
+        # Options
+        try:
+            data = await self._call(
+                self._http.get_positions,
+                category="option",
+                baseCoin=config.BASE_COIN,
+            )
+            for p in data.get("result", {}).get("list", []) or []:
+                size = float(p.get("size", 0) or 0)
+                if size == 0:
+                    continue
+                side = p.get("side", "")
+                signed = size if side == "Buy" else -size
+                out.append({
+                    "category": "option",
+                    "symbol": p.get("symbol", ""),
+                    "amount": signed,
+                    "average_price": float(p.get("avgPrice", 0) or 0),
+                    "mark_price": float(p.get("markPrice", 0) or 0),
+                    "unrealized_pnl": float(p.get("unrealisedPnl", 0) or 0),
+                })
+        except Exception:
+            log.warning("list_option_positions_failed", exc_info=True)
+
+        # Spot (only flag if the BTC balance looks like a held position)
+        try:
+            btc_bal = await self.get_spot_balance(config.BASE_COIN)
+            spot_threshold = config.QTY_PER_LEG / 2  # half a leg = orphan
+            if btc_bal >= spot_threshold:
+                spot_price = await self.get_spot_price()
+                out.append({
+                    "category": "spot",
+                    "symbol": config.SPOT_SYMBOL,
+                    "amount": btc_bal,
+                    "average_price": 0.0,
+                    "mark_price": spot_price,
+                    "unrealized_pnl": 0.0,
+                })
+        except Exception:
+            log.warning("list_spot_position_failed", exc_info=True)
+
+        return out
+
     # ──────────────────── Order Helpers ───────────────────────────
 
     def _fake_order(self, side: str, symbol: str, qty: float, price: float) -> dict:
@@ -444,10 +581,19 @@ class BybitExchange:
         log.warning("spot_sell_chase_exhausted", qty=qty)
         return {}
 
-    # ──────────────────── Option Orders (GTC Limit for maker) ──────
+    # ──────────────────── Option Orders (PostOnly for guaranteed maker) ──
 
-    async def _place_option_limit(self, side: str, symbol: str, qty: float, price: float, reduce: bool = False) -> dict:
-        """Place a GTC Limit order on options. Maker when priced at bid/ask."""
+    async def _place_option_limit(
+        self, side: str, symbol: str, qty: float, price: float,
+        reduce: bool = False, post_only: bool = True,
+    ) -> dict:
+        """Place a PostOnly Limit order on options.
+
+        timeInForce='PostOnly' guarantees the order is rejected if it would
+        cross the spread — no taker fills possible. If rejected, returns a
+        dict with rejected_post_only=True so the caller can reprice.
+        """
+        tif = "PostOnly" if post_only else "GTC"
         params = dict(
             category="option",
             symbol=symbol,
@@ -455,13 +601,23 @@ class BybitExchange:
             orderType="Limit",
             qty=str(qty),
             price=str(price),
-            timeInForce="GTC",
+            timeInForce=tif,
             orderLinkId=f"{'bp' if side == 'Buy' else 'sp'}-{uuid.uuid4().hex[:16]}",
         )
         if reduce:
             params["reduceOnly"] = True
-        data = await self._call(self._http.place_order, **params)
-        return data["result"]
+        try:
+            data = await self._call(self._http.place_order, **params)
+            return data["result"]
+        except Exception as exc:
+            err_str = str(exc)
+            # Bybit V5 post-only rejection codes:
+            #   110017 — order would immediately match
+            #   110079 — order would match with own order
+            if "ErrCode: 110017" in err_str or "ErrCode: 110079" in err_str:
+                log.debug("post_only_rejected", symbol=symbol, price=price)
+                return {"rejected_post_only": True}
+            raise
 
     async def _wait_option_fill(self, symbol: str, order_id: str, timeout: float) -> dict:
         """Wait for an option order to fill. Checks open orders then history."""
@@ -600,6 +756,11 @@ class BybitExchange:
             result = await self._place_option_limit(
                 "Buy", symbol, remaining_qty, current_price
             )
+            if result.get("rejected_post_only"):
+                log.debug("chase_buy_post_only_reject", symbol=symbol,
+                          price=current_price, attempt=attempt)
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
             order_id = result.get("orderId", "")
             if not order_id:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
@@ -758,6 +919,11 @@ class BybitExchange:
             result = await self._place_option_limit(
                 "Sell", symbol, remaining_qty, current_price, reduce=True
             )
+            if result.get("rejected_post_only"):
+                log.debug("chase_sell_post_only_reject", symbol=symbol,
+                          price=current_price, attempt=attempt)
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
             order_id = result.get("orderId", "")
             if not order_id:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)

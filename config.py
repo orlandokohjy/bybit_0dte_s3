@@ -99,6 +99,18 @@ MAX_DAILY_LOSS_PCT: float | None = None      # disabled — no daily loss halt
 CIRCUIT_BREAKER_API_ERRORS: int = 5
 CIRCUIT_BREAKER_COOLDOWN_SEC: float = 300.0
 
+# Pre-entry collateral safety buffer — entry is skipped unless
+# available USDT balance ≥ expected_premium × this factor.
+COLLATERAL_BUFFER_FACTOR: float = float(
+    os.getenv("COLLATERAL_BUFFER_FACTOR", "1.2")
+)
+
+# Lock the algo after this many consecutive session failures
+# (build_straddle returning None or raising). Manual unlock required.
+CONSECUTIVE_FAILURE_LIMIT: int = int(
+    os.getenv("CONSECUTIVE_FAILURE_LIMIT", "3")
+)
+
 # ───────────────────────── Telegram ──────────────────────────────
 
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
