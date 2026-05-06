@@ -300,9 +300,13 @@ class Portfolio:
             with open(config.TRADE_LOG_FILE, "r") as f:
                 existing_header = f.readline().strip().split(",")
             if existing_header != TRADE_LOG_FIELDS:
-                needs_header = True
+                # _rewrite_csv_header already writes the new header to the
+                # migrated file, so we must NOT re-write it before appending
+                # this trade — otherwise the CSV ends up with a duplicate
+                # header row mid-file that breaks DictReader on read.
                 log.warning("trade_log_schema_mismatch", rewriting_header=True)
                 self._rewrite_csv_header(existing_header)
+                needs_header = False
 
         with open(config.TRADE_LOG_FILE, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
