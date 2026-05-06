@@ -8,7 +8,7 @@ from __future__ import annotations
 import csv
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -27,6 +27,24 @@ TRADE_LOG_FIELDS = [
     "straddle_cost", "capital_before",
     "spot_pnl", "put_pnl", "gross_pnl", "fees", "net_pnl",
     "capital_after",
+    # Execution-quality metrics — entry
+    "spot_entry_duration_sec", "spot_entry_attempts",
+    "spot_entry_ref_mark", "spot_entry_ref_ask",
+    "spot_entry_slippage_vs_mark_pct",
+    "spot_entry_saved_vs_taker_usd",
+    "put_entry_duration_sec", "put_entry_attempts",
+    "put_entry_ref_mark", "put_entry_ref_ask",
+    "put_entry_slippage_vs_mark_pct",
+    "put_entry_saved_vs_taker_usd",
+    # Execution-quality metrics — exit
+    "spot_exit_duration_sec", "spot_exit_attempts",
+    "spot_exit_ref_mark", "spot_exit_ref_bid",
+    "spot_exit_slippage_vs_mark_pct",
+    "spot_exit_saved_vs_taker_usd",
+    "put_exit_duration_sec", "put_exit_attempts",
+    "put_exit_ref_mark", "put_exit_ref_bid",
+    "put_exit_slippage_vs_mark_pct",
+    "put_exit_saved_vs_taker_usd",
 ]
 
 
@@ -38,6 +56,10 @@ class StraddleLeg:
     entry_price: float
     order_id: str = ""
     avg_fill_price: float = 0.0
+    # Execution-quality metrics, captured at fill time. See
+    # core.exchange._build_fill_metrics for the keys produced.
+    entry_metrics: dict = field(default_factory=dict)
+    exit_metrics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -201,6 +223,26 @@ class Portfolio:
         put_cost = s.total_put_cost * s.num_straddles
         total_capital_used = spot_margin + put_cost
 
+        # Per-leg execution metrics — spot has one leg; puts have NUM_PUTS
+        # legs which we aggregate (mean duration/attempts/slippage, sum
+        # saved_vs_taker so the dollar amount is the total across legs).
+        se = s.spot_leg.entry_metrics or {}
+        sx = s.spot_leg.exit_metrics or {}
+        pe_metrics = [pl.entry_metrics for pl in s.put_legs if pl.entry_metrics]
+        px_metrics = [pl.exit_metrics for pl in s.put_legs if pl.exit_metrics]
+
+        def _avg(items: list, key: str) -> float:
+            vals = [m.get(key, 0) for m in items if m.get(key) not in (None, "")]
+            return round(sum(vals) / len(vals), 4) if vals else 0.0
+
+        def _sum(items: list, key: str) -> float:
+            vals = [m.get(key, 0) for m in items if m.get(key) not in (None, "")]
+            return round(sum(vals), 2) if vals else 0.0
+
+        def _max_int(items: list, key: str) -> int:
+            vals = [int(m.get(key, 0) or 0) for m in items]
+            return max(vals) if vals else 0
+
         row = {
             "date": s.entry_time[:10],
             "entry_time": s.entry_time,
@@ -223,6 +265,34 @@ class Portfolio:
             "fees": 0.0,
             "net_pnl": s.pnl,
             "capital_after": self._equity,
+            # Spot leg — entry
+            "spot_entry_duration_sec": se.get("duration_sec", ""),
+            "spot_entry_attempts": se.get("attempts", ""),
+            "spot_entry_ref_mark": se.get("ref_mark", ""),
+            "spot_entry_ref_ask": se.get("ref_ask", ""),
+            "spot_entry_slippage_vs_mark_pct": se.get("slippage_vs_mark_pct", ""),
+            "spot_entry_saved_vs_taker_usd": se.get("saved_vs_taker_total_usd", ""),
+            # Put legs — entry (averaged across NUM_PUTS legs)
+            "put_entry_duration_sec": _avg(pe_metrics, "duration_sec"),
+            "put_entry_attempts": _max_int(pe_metrics, "attempts"),
+            "put_entry_ref_mark": _avg(pe_metrics, "ref_mark"),
+            "put_entry_ref_ask": _avg(pe_metrics, "ref_ask"),
+            "put_entry_slippage_vs_mark_pct": _avg(pe_metrics, "slippage_vs_mark_pct"),
+            "put_entry_saved_vs_taker_usd": _sum(pe_metrics, "saved_vs_taker_total_usd"),
+            # Spot leg — exit
+            "spot_exit_duration_sec": sx.get("duration_sec", ""),
+            "spot_exit_attempts": sx.get("attempts", ""),
+            "spot_exit_ref_mark": sx.get("ref_mark", ""),
+            "spot_exit_ref_bid": sx.get("ref_bid", ""),
+            "spot_exit_slippage_vs_mark_pct": sx.get("slippage_vs_mark_pct", ""),
+            "spot_exit_saved_vs_taker_usd": sx.get("saved_vs_taker_total_usd", ""),
+            # Put legs — exit
+            "put_exit_duration_sec": _avg(px_metrics, "duration_sec"),
+            "put_exit_attempts": _max_int(px_metrics, "attempts"),
+            "put_exit_ref_mark": _avg(px_metrics, "ref_mark"),
+            "put_exit_ref_bid": _avg(px_metrics, "ref_bid"),
+            "put_exit_slippage_vs_mark_pct": _avg(px_metrics, "slippage_vs_mark_pct"),
+            "put_exit_saved_vs_taker_usd": _sum(px_metrics, "saved_vs_taker_total_usd"),
         }
 
         needs_header = not os.path.exists(config.TRADE_LOG_FILE)

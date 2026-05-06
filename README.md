@@ -4,7 +4,7 @@ Automated trading bot that executes a **long-gamma synthetic straddle** strategy
 
 ## Strategy Overview
 
-The bot runs a single daily session (14:00–18:00 UTC, Monday to Friday) and constructs synthetic long straddles:
+The bot runs a single daily session (12:00–16:00 UTC, Monday to Friday) and constructs synthetic long straddles:
 
 | Leg | Instrument | Direction | Purpose |
 |-----|-----------|-----------|---------|
@@ -15,10 +15,10 @@ A synthetic straddle replicates the payoff of being long both a call and a put �
 
 ### Daily Workflow
 
-1. **14:00 UTC** — Algo sizes the position based on 60% of current equity (compound growth), runs a pre-flight capital check to ensure enough funds for complete straddles, then enters:
+1. **12:00 UTC** — Algo sizes the position based on 80% of current equity (compound growth), runs a pre-flight capital check to ensure enough funds for complete straddles, then enters:
    - Buys BTC spot on margin (GTC limit at bid — maker)
    - Buys 2 ITM put options per straddle (GTC limit at bid — maker)
-2. **18:00 UTC** — Hard close: sells all spot then sells all puts. No early exit.
+2. **16:00 UTC** — Hard close: sells all spot then sells all puts. No early exit.
 
 ### Execution Details
 
@@ -131,8 +131,8 @@ This connects to Bybit Demo (real market data, simulated fills), runs the full a
 | `NUM_PUTS` | 2 | Put contracts per straddle |
 | `ALLOC_PCT` | 0.60 | 60% of equity allocated per session |
 | `INITIAL_CAPITAL_USD` | 7,900 | Starting equity for compound tracking |
-| `SESSION_ENTRY_UTC` | 14:00 | Daily entry time |
-| `SESSION_CLOSE_UTC` | 18:00 | Daily hard close time |
+| `SESSION_ENTRY_UTC` | 12:00 | Daily entry time |
+| `SESSION_CLOSE_UTC` | 16:00 | Daily hard close time |
 | `MAX_DAILY_LOSS_PCT` | None | Daily loss halt disabled (set to e.g. 0.10 to enable) |
 
 ## Margin Methodology
@@ -250,7 +250,7 @@ Current rates are visible on Bybit's [Margin Data page](https://www.bybit.com/an
 
 ## Execution Algorithm
 
-### Entry Sequence (14:00 UTC)
+### Entry Sequence (12:00 UTC)
 
 1. **Refresh 0DTE option chain** — fetch all USDT-settled puts expiring today
 2. **Select ITM put** — scan from nearest ITM strike upward, pick first with bid/ask spread < 10%
@@ -268,7 +268,7 @@ Current rates are visible on Bybit's [Margin Data page](https://www.bybit.com/an
    - 2 put legs per straddle, each QTY_PER_LEG BTC
 6. If any leg fails, all previously filled legs are unwound immediately
 
-### Exit Sequence (18:00 UTC)
+### Exit Sequence (16:00 UTC)
 
 1. **Sell spot first** — GTC limit at ask, same chase logic as entry
 2. **Sell puts** — GTC limit at ask, same chase logic as entry

@@ -1,9 +1,9 @@
 """
 Central configuration — Bybit 0DTE BTC Synthetic Straddle (Session 3 Only).
 
-Single daily session: 14:00–18:00 UTC, Mon–Fri.
+Single daily session: 12:00–16:00 UTC, Mon–Fri.
 Position: 0.5 BTC spot (margin) + 2 × 0.5 BTC ITM puts per straddle.
-Compound sizing: 60 % of current equity, no cap.
+Compound sizing: 80 % of current equity, no cap.
 """
 from __future__ import annotations
 
@@ -49,14 +49,14 @@ MIN_OPEN_INTEREST: float = 0.0
 
 # ────────────────────────── Session ──────────────────────────────
 
-SESSION_ENTRY_UTC: time = time(14, 0)
-SESSION_CLOSE_UTC: time = time(18, 0)
-REPORT_UTC: time = time(19, 0)
-WEEKLY_REPORT_UTC: time = time(20, 0)
+SESSION_ENTRY_UTC: time = time(12, 0)
+SESSION_CLOSE_UTC: time = time(16, 0)
+REPORT_UTC: time = time(17, 0)
+WEEKLY_REPORT_UTC: time = time(18, 0)
 ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri
 
 # ───────────────────── Exit ───────────────────────────────────────
-# No take-profit — all positions hold until 18:00 UTC hard close.
+# No take-profit — all positions hold until 16:00 UTC hard close.
 
 # ──────────────────── Execution Settings ─────────────────────────
 

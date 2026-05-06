@@ -1,7 +1,7 @@
 """
 Exit management: hard close only (no take-profit).
 
-All positions hold until 18:00 UTC session close.
+All positions hold until 16:00 UTC session close.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ class ExitManager:
         self._portfolio = portfolio
 
     async def hard_close(self) -> float:
-        """Hard close at session end (18:00 UTC)."""
+        """Hard close at session end (16:00 UTC)."""
         if not self._portfolio.has_open:
             log.info("nothing_to_close")
             return 0.0

@@ -12,7 +12,7 @@ import threading
 import time as _time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 import structlog
@@ -32,6 +32,80 @@ def _round_price_down(price: float) -> float:
     """Round option price DOWN to nearest tick (for sells)."""
     return max(config.OPTION_TICK_SIZE,
                math.floor(price / config.OPTION_TICK_SIZE) * config.OPTION_TICK_SIZE)
+
+
+def _utc_iso(t_unix: float) -> str:
+    """Convert a unix timestamp to a UTC ISO8601 string."""
+    return datetime.fromtimestamp(t_unix, tz=timezone.utc).isoformat()
+
+
+def _build_fill_metrics(
+    *,
+    side: str,
+    instrument: str,
+    qty_btc: float,
+    fill_price: float,
+    t_started: float,
+    t_filled: float,
+    attempts: int,
+    ref_bid: float,
+    ref_ask: float,
+    ref_mark: float,
+) -> dict:
+    """
+    Build the fill-quality metrics dict that flows from chase_buy/sell
+    (and buy_spot/sell_spot) back to the straddle builder/exit manager
+    and ultimately into the daily report.
+
+    Slippage is positive when we paid more than mark (buys) or
+    received less than mark (sells) — i.e. execution worse than fair
+    value. Negative = better than fair value.
+
+    For spot legs the "mark" is taken as the mid (bid + ask) / 2 since
+    Bybit spot does not publish a mark price.
+    """
+    duration = max(0.0, t_filled - t_started)
+    ref_mid = (ref_bid + ref_ask) / 2 if ref_bid > 0 and ref_ask > 0 else 0.0
+
+    if side.lower() in ("buy", "b"):
+        slip_mark = ((fill_price - ref_mark) / ref_mark
+                     if ref_mark > 0 else 0.0)
+        slip_mid = ((fill_price - ref_mid) / ref_mid
+                    if ref_mid > 0 else 0.0)
+        # Maker buy → taker alternative is paying the ask.
+        taker_price = ref_ask
+        saved_per_unit = (ref_ask - fill_price) if ref_ask > 0 else 0.0
+        saved_pct = (saved_per_unit / ref_ask) if ref_ask > 0 else 0.0
+    else:  # sell
+        slip_mark = ((ref_mark - fill_price) / ref_mark
+                     if ref_mark > 0 else 0.0)
+        slip_mid = ((ref_mid - fill_price) / ref_mid
+                    if ref_mid > 0 else 0.0)
+        # Maker sell → taker alternative is hitting the bid.
+        taker_price = ref_bid
+        saved_per_unit = (fill_price - ref_bid) if ref_bid > 0 else 0.0
+        saved_pct = (saved_per_unit / ref_bid) if ref_bid > 0 else 0.0
+
+    return {
+        "instrument": instrument,
+        "side": side,
+        "qty_btc": qty_btc,
+        "t_started_iso": _utc_iso(t_started),
+        "t_filled_iso": _utc_iso(t_filled),
+        "duration_sec": round(duration, 2),
+        "attempts": attempts,
+        "ref_bid": round(ref_bid, 4),
+        "ref_ask": round(ref_ask, 4),
+        "ref_mid": round(ref_mid, 4),
+        "ref_mark": round(ref_mark, 4),
+        "fill_price": round(fill_price, 4),
+        "slippage_vs_mark_pct": round(slip_mark * 100, 4),
+        "slippage_vs_mid_pct": round(slip_mid * 100, 4),
+        "taker_price_at_start": round(taker_price, 4),
+        "saved_vs_taker_per_unit_usd": round(saved_per_unit, 4),
+        "saved_vs_taker_pct": round(saved_pct * 100, 4),
+        "saved_vs_taker_total_usd": round(saved_per_unit * qty_btc, 2),
+    }
 
 
 @dataclass
@@ -486,11 +560,17 @@ class BybitExchange:
         cancels and re-posts at the updated bid.  After every cancel, the
         order's final state is verified to prevent duplicate orders when a
         fill arrives between the timeout and the cancel.
+
+        Returns dict with `metrics` populated on fill (see _build_fill_metrics).
         """
         log.info("buy_spot_maker", qty=qty)
         if config.DRY_RUN:
             price = await self.get_spot_price()
             return self._fake_order("Buy", config.SPOT_SYMBOL, qty, price)
+
+        t_started = _time.time()
+        ref_bid = ref_ask = ref_mark = 0.0
+        captured_ref = False
 
         for attempt in range(config.SPOT_CHASE_MAX_ATTEMPTS):
             cached = self.get_cached_spot()
@@ -498,6 +578,13 @@ class BybitExchange:
                 price = self._round_spot_price(cached.bid, "down")
             else:
                 price = self._round_spot_price(await self.get_spot_price(), "down")
+
+            # Capture decision-time market state for slippage metrics.
+            if not captured_ref and cached and cached.bid > 0 and cached.ask > 0:
+                ref_bid = cached.bid
+                ref_ask = cached.ask
+                ref_mark = (cached.bid + cached.ask) / 2  # spot has no mark
+                captured_ref = True
 
             result = await self._place_spot_limit("Buy", qty, price)
             order_id = result.get("orderId", "")
@@ -508,8 +595,21 @@ class BybitExchange:
 
             if fill and fill.get("orderStatus") == "Filled":
                 fill_price = float(fill.get("avgPrice", price))
-                log.info("spot_buy_filled", price=fill_price, attempt=attempt + 1)
-                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+                t_filled = _time.time()
+                metrics = _build_fill_metrics(
+                    side="buy", instrument=config.SPOT_SYMBOL,
+                    qty_btc=qty, fill_price=fill_price,
+                    t_started=t_started, t_filled=t_filled,
+                    attempts=attempt + 1,
+                    ref_bid=ref_bid or price, ref_ask=ref_ask or price,
+                    ref_mark=ref_mark or price,
+                )
+                log.info("spot_buy_filled", price=fill_price,
+                         attempt=attempt + 1,
+                         duration_sec=metrics["duration_sec"],
+                         saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"])
+                return {"orderId": order_id, "orderStatus": "Filled",
+                        "avgPrice": str(fill_price), "metrics": metrics}
 
             await self.cancel_order(config.SPOT_CATEGORY, config.SPOT_SYMBOL, order_id)
 
@@ -520,10 +620,22 @@ class BybitExchange:
             cum_qty = float(final.get("cumExecQty", 0))
             if cum_qty > 0:
                 fill_price = float(final.get("avgPrice", price))
+                t_filled = _time.time()
+                metrics = _build_fill_metrics(
+                    side="buy", instrument=config.SPOT_SYMBOL,
+                    qty_btc=cum_qty, fill_price=fill_price,
+                    t_started=t_started, t_filled=t_filled,
+                    attempts=attempt + 1,
+                    ref_bid=ref_bid or price, ref_ask=ref_ask or price,
+                    ref_mark=ref_mark or price,
+                )
                 log.info("spot_buy_filled_post_cancel", price=fill_price,
-                         qty_filled=cum_qty, status=final_status, attempt=attempt + 1)
+                         qty_filled=cum_qty, status=final_status,
+                         attempt=attempt + 1,
+                         duration_sec=metrics["duration_sec"])
                 return {"orderId": order_id, "orderStatus": "Filled",
-                        "avgPrice": str(fill_price), "cumExecQty": str(cum_qty)}
+                        "avgPrice": str(fill_price),
+                        "cumExecQty": str(cum_qty), "metrics": metrics}
 
             log.debug("spot_buy_chase", attempt=attempt + 1, price=price)
 
@@ -537,11 +649,17 @@ class BybitExchange:
         Uses GTC limit at ask price. If not filled within the chase interval,
         cancels and re-posts at the updated ask.  Post-cancel verification
         prevents duplicate sells when a fill races with the timeout.
+
+        Returns dict with `metrics` populated on fill (see _build_fill_metrics).
         """
         log.info("sell_spot_maker", qty=qty)
         if config.DRY_RUN:
             price = await self.get_spot_price()
             return self._fake_order("Sell", config.SPOT_SYMBOL, qty, price)
+
+        t_started = _time.time()
+        ref_bid = ref_ask = ref_mark = 0.0
+        captured_ref = False
 
         for attempt in range(config.SPOT_CHASE_MAX_ATTEMPTS):
             cached = self.get_cached_spot()
@@ -549,6 +667,12 @@ class BybitExchange:
                 price = self._round_spot_price(cached.ask, "up")
             else:
                 price = self._round_spot_price(await self.get_spot_price(), "up")
+
+            if not captured_ref and cached and cached.bid > 0 and cached.ask > 0:
+                ref_bid = cached.bid
+                ref_ask = cached.ask
+                ref_mark = (cached.bid + cached.ask) / 2
+                captured_ref = True
 
             result = await self._place_spot_limit("Sell", qty, price)
             order_id = result.get("orderId", "")
@@ -559,8 +683,21 @@ class BybitExchange:
 
             if fill and fill.get("orderStatus") == "Filled":
                 fill_price = float(fill.get("avgPrice", price))
-                log.info("spot_sell_filled", price=fill_price, attempt=attempt + 1)
-                return {"orderId": order_id, "orderStatus": "Filled", "avgPrice": str(fill_price)}
+                t_filled = _time.time()
+                metrics = _build_fill_metrics(
+                    side="sell", instrument=config.SPOT_SYMBOL,
+                    qty_btc=qty, fill_price=fill_price,
+                    t_started=t_started, t_filled=t_filled,
+                    attempts=attempt + 1,
+                    ref_bid=ref_bid or price, ref_ask=ref_ask or price,
+                    ref_mark=ref_mark or price,
+                )
+                log.info("spot_sell_filled", price=fill_price,
+                         attempt=attempt + 1,
+                         duration_sec=metrics["duration_sec"],
+                         saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"])
+                return {"orderId": order_id, "orderStatus": "Filled",
+                        "avgPrice": str(fill_price), "metrics": metrics}
 
             await self.cancel_order(config.SPOT_CATEGORY, config.SPOT_SYMBOL, order_id)
 
@@ -571,10 +708,22 @@ class BybitExchange:
             cum_qty = float(final.get("cumExecQty", 0))
             if cum_qty > 0:
                 fill_price = float(final.get("avgPrice", price))
+                t_filled = _time.time()
+                metrics = _build_fill_metrics(
+                    side="sell", instrument=config.SPOT_SYMBOL,
+                    qty_btc=cum_qty, fill_price=fill_price,
+                    t_started=t_started, t_filled=t_filled,
+                    attempts=attempt + 1,
+                    ref_bid=ref_bid or price, ref_ask=ref_ask or price,
+                    ref_mark=ref_mark or price,
+                )
                 log.info("spot_sell_filled_post_cancel", price=fill_price,
-                         qty_filled=cum_qty, status=final_status, attempt=attempt + 1)
+                         qty_filled=cum_qty, status=final_status,
+                         attempt=attempt + 1,
+                         duration_sec=metrics["duration_sec"])
                 return {"orderId": order_id, "orderStatus": "Filled",
-                        "avgPrice": str(fill_price), "cumExecQty": str(cum_qty)}
+                        "avgPrice": str(fill_price),
+                        "cumExecQty": str(cum_qty), "metrics": metrics}
 
             log.debug("spot_sell_chase", attempt=attempt + 1, price=price)
 
@@ -712,6 +861,9 @@ class BybitExchange:
         total_filled = 0.0
         current_price = _round_price_up(initial_bid)
         attempt = 0
+        t_started = _time.time()
+        ref_bid = ref_ask = ref_mark = 0.0
+        captured_ref = False
 
         log.info(
             "chase_buy_put_start",
@@ -726,6 +878,14 @@ class BybitExchange:
         while _time.time() < deadline and remaining_qty > 0:
             attempt += 1
             cached = self.get_cached_option(symbol)
+
+            # Capture decision-time market state for slippage metrics.
+            if not captured_ref and cached and cached.ask > 0:
+                ref_bid = cached.bid
+                ref_ask = cached.ask
+                ref_mark = (cached.mark if cached.mark > 0
+                            else (cached.bid + cached.ask) / 2)
+                captured_ref = True
 
             if cached and cached.bid > 0 and cached.ask > 0:
                 target_ceiling = cached.ask - tick
@@ -776,17 +936,29 @@ class BybitExchange:
                 total_filled += remaining_qty
                 remaining_qty = 0.0
                 avg_price = weighted_cost / total_filled
+                t_filled = _time.time()
+                metrics = _build_fill_metrics(
+                    side="buy", instrument=symbol,
+                    qty_btc=total_filled, fill_price=avg_price,
+                    t_started=t_started, t_filled=t_filled,
+                    attempts=attempt,
+                    ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
+                )
                 log.info(
                     "chase_buy_filled",
                     symbol=symbol,
                     price=fill_price,
                     total_filled=total_filled,
                     attempt=attempt,
+                    duration_sec=metrics["duration_sec"],
+                    slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
+                    saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"],
                 )
                 return {
                     "orderId": order_id,
                     "orderStatus": "Filled",
                     "avgPrice": str(avg_price),
+                    "metrics": metrics,
                 }
 
             await self.cancel_order("option", symbol, order_id)
@@ -817,6 +989,14 @@ class BybitExchange:
         # ── Deadline expired ──
         if total_filled > 0:
             avg_price = weighted_cost / total_filled
+            t_filled = _time.time()
+            metrics = _build_fill_metrics(
+                side="buy", instrument=symbol,
+                qty_btc=total_filled, fill_price=avg_price,
+                t_started=t_started, t_filled=t_filled,
+                attempts=attempt,
+                ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
+            )
             log.warning(
                 "chase_buy_partial_at_deadline",
                 symbol=symbol,
@@ -829,6 +1009,7 @@ class BybitExchange:
                 "orderStatus": "PartiallyFilled",
                 "avgPrice": str(avg_price),
                 "cumExecQty": str(total_filled),
+                "metrics": metrics,
             }
 
         log.warning(
@@ -873,6 +1054,9 @@ class BybitExchange:
         total_filled = 0.0
         current_price = _round_price_down(initial_ask)
         attempt = 0
+        t_started = _time.time()
+        ref_bid = ref_ask = ref_mark = 0.0
+        captured_ref = False
 
         log.info(
             "chase_sell_put_start",
@@ -887,6 +1071,14 @@ class BybitExchange:
         while _time.time() < deadline and remaining_qty > 0:
             attempt += 1
             cached = self.get_cached_option(symbol)
+
+            # Capture decision-time market state for slippage metrics.
+            if not captured_ref and cached and (cached.bid > 0 or cached.mark > 0):
+                ref_bid = cached.bid
+                ref_ask = cached.ask
+                ref_mark = (cached.mark if cached.mark > 0
+                            else (cached.bid + cached.ask) / 2)
+                captured_ref = True
 
             if cached and cached.bid > 0 and cached.ask > 0:
                 target_floor = cached.bid + tick
@@ -939,17 +1131,29 @@ class BybitExchange:
                 total_filled += remaining_qty
                 remaining_qty = 0.0
                 avg_price = weighted_revenue / total_filled
+                t_filled = _time.time()
+                metrics = _build_fill_metrics(
+                    side="sell", instrument=symbol,
+                    qty_btc=total_filled, fill_price=avg_price,
+                    t_started=t_started, t_filled=t_filled,
+                    attempts=attempt,
+                    ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
+                )
                 log.info(
                     "chase_sell_filled",
                     symbol=symbol,
                     price=fill_price,
                     total_filled=total_filled,
                     attempt=attempt,
+                    duration_sec=metrics["duration_sec"],
+                    slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
+                    saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"],
                 )
                 return {
                     "orderId": order_id,
                     "orderStatus": "Filled",
                     "avgPrice": str(avg_price),
+                    "metrics": metrics,
                 }
 
             await self.cancel_order("option", symbol, order_id)
@@ -980,6 +1184,14 @@ class BybitExchange:
         # ── Deadline expired ──
         if total_filled > 0:
             avg_price = weighted_revenue / total_filled
+            t_filled = _time.time()
+            metrics = _build_fill_metrics(
+                side="sell", instrument=symbol,
+                qty_btc=total_filled, fill_price=avg_price,
+                t_started=t_started, t_filled=t_filled,
+                attempts=attempt,
+                ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
+            )
             log.warning(
                 "chase_sell_partial_at_deadline",
                 symbol=symbol,
@@ -992,6 +1204,7 @@ class BybitExchange:
                 "orderStatus": "PartiallyFilled",
                 "avgPrice": str(avg_price),
                 "cumExecQty": str(total_filled),
+                "metrics": metrics,
             }
 
         log.warning(

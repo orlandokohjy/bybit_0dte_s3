@@ -1,7 +1,7 @@
 """
 Bybit 0DTE BTC Synthetic Straddle — Session 3 Only.
 
-Single daily session: 14:00–18:00 UTC, Mon–Fri.
+Single daily session: 12:00–16:00 UTC, Mon–Fri.
 Position: 0.5 BTC spot (margin) + 2 × 0.5 BTC ITM puts per straddle.
 Compound sizing: 80 % of current equity, no cap on straddles.
 """
@@ -471,7 +471,7 @@ class Algo:
             log.error("close_error", exc_info=True)
             await notifier.notify_error("Close", "Unhandled exception — check logs")
 
-    # ──────────────────── Daily Report (19:00 UTC) ────────────────
+    # ──────────────────── Daily Report (17:00 UTC) ────────────────
 
     async def _on_report(self) -> None:
         try:
@@ -480,7 +480,7 @@ class Algo:
             log.error("report_error", exc_info=True)
             await notifier.notify_error("Report", "Daily report failed — check logs")
 
-    # ──────────────────── Weekly Report (Fri 20:00 UTC) ─────────
+    # ──────────────────── Weekly Report (Fri 18:00 UTC) ─────────
 
     async def _on_weekly_report(self) -> None:
         try:

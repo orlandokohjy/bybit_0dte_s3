@@ -128,6 +128,7 @@ async def build_straddle(
             instrument=put.symbol, side="Buy",
             qty=total_put_qty, entry_price=fill_price,
             order_id=result.get("orderId", ""), avg_fill_price=fill_price,
+            entry_metrics=result.get("metrics", {}) or {},
         ))
         log.info("put_filled", id=straddle_id, leg=i + 1, price=fill_price)
 
@@ -164,6 +165,7 @@ async def build_straddle(
         instrument=config.SPOT_SYMBOL, side="Buy",
         qty=total_spot_qty, entry_price=spot_fill,
         order_id=spot_order_id, avg_fill_price=spot_fill,
+        entry_metrics=spot_result.get("metrics", {}) or {},
     )
 
     # ── Step 5: Register straddle ──
@@ -214,6 +216,8 @@ async def unwind_straddle(
         sell_result = await exchange.sell_spot(straddle.spot_leg.qty)
         if not sell_result or not sell_result.get("orderId"):
             log.error("spot_sell_chase_exhausted", id=straddle.id)
+        else:
+            straddle.spot_leg.exit_metrics = sell_result.get("metrics", {}) or {}
     except Exception as exc:
         log.error("spot_sell_failed", id=straddle.id, error=str(exc))
 
@@ -229,6 +233,7 @@ async def unwind_straddle(
             if result:
                 price = float(result.get("avgPrice", ask))
                 put_prices.append(price)
+                pl.exit_metrics = result.get("metrics", {}) or {}
                 log.info("put_sold", instrument=pl.instrument, price=price)
 
                 remaining_pos = await exchange.get_option_position(pl.instrument)

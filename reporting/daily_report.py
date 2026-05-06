@@ -25,6 +25,17 @@ RISK_FREE_RATE = 0.0
 
 
 @dataclass
+class ExecutionMetrics:
+    """Per-leg fill quality for one trade."""
+    duration_sec: float = 0.0
+    attempts: int = 0
+    ref_mark: float = 0.0
+    ref_quote: float = 0.0   # ask for entries, bid for exits
+    slippage_vs_mark_pct: float = 0.0
+    saved_vs_taker_usd: float = 0.0
+
+
+@dataclass
 class TradeRow:
     date: str
     net_pnl: float
@@ -41,6 +52,10 @@ class TradeRow:
     put_premium_cost: float = 0.0
     total_capital_used: float = 0.0
     put_strike: float = 0.0
+    spot_entry_exec: Optional[ExecutionMetrics] = None
+    put_entry_exec: Optional[ExecutionMetrics] = None
+    spot_exit_exec: Optional[ExecutionMetrics] = None
+    put_exit_exec: Optional[ExecutionMetrics] = None
 
 
 @dataclass
@@ -106,6 +121,50 @@ class DailyMetrics:
     total_capital_used: float
     put_strike: float
 
+    # Equity / spot snapshots (added for context — verify strike selection)
+    starting_equity: float = 0.0
+
+    # Per-leg execution quality (today's trade only)
+    spot_entry_exec: Optional[ExecutionMetrics] = None
+    put_entry_exec: Optional[ExecutionMetrics] = None
+    spot_exit_exec: Optional[ExecutionMetrics] = None
+    put_exit_exec: Optional[ExecutionMetrics] = None
+
+
+def _f(row: dict, key: str, default: float = 0.0) -> float:
+    """Best-effort float parse — returns default if blank or invalid."""
+    raw = row.get(key, "")
+    if raw == "" or raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _i(row: dict, key: str, default: int = 0) -> int:
+    raw = row.get(key, "")
+    if raw == "" or raw is None:
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def _exec_from_row(
+    row: dict, prefix: str, quote_key: str,
+) -> ExecutionMetrics:
+    """Extract one leg/side's execution metrics from a CSV row."""
+    return ExecutionMetrics(
+        duration_sec=_f(row, f"{prefix}_duration_sec"),
+        attempts=_i(row, f"{prefix}_attempts"),
+        ref_mark=_f(row, f"{prefix}_ref_mark"),
+        ref_quote=_f(row, f"{prefix}_{quote_key}"),
+        slippage_vs_mark_pct=_f(row, f"{prefix}_slippage_vs_mark_pct"),
+        saved_vs_taker_usd=_f(row, f"{prefix}_saved_vs_taker_usd"),
+    )
+
 
 def _load_trades() -> list[TradeRow]:
     path = config.TRADE_LOG_FILE
@@ -132,6 +191,18 @@ def _load_trades() -> list[TradeRow]:
                     put_premium_cost=float(row.get("put_premium_cost", 0)),
                     total_capital_used=float(row.get("total_capital_used", 0)),
                     put_strike=float(row.get("put_strike", 0)),
+                    spot_entry_exec=_exec_from_row(
+                        row, "spot_entry", "ref_ask",
+                    ),
+                    put_entry_exec=_exec_from_row(
+                        row, "put_entry", "ref_ask",
+                    ),
+                    spot_exit_exec=_exec_from_row(
+                        row, "spot_exit", "ref_bid",
+                    ),
+                    put_exit_exec=_exec_from_row(
+                        row, "put_exit", "ref_bid",
+                    ),
                 ))
             except (ValueError, KeyError):
                 continue
@@ -279,7 +350,85 @@ def compute_report(equity: float) -> Optional[DailyMetrics]:
         put_premium_cost=latest.put_premium_cost,
         total_capital_used=latest.total_capital_used,
         put_strike=latest.put_strike,
+        starting_equity=latest.capital_before,
+        spot_entry_exec=latest.spot_entry_exec,
+        put_entry_exec=latest.put_entry_exec,
+        spot_exit_exec=latest.spot_exit_exec,
+        put_exit_exec=latest.put_exit_exec,
     )
+
+
+def _format_exec_block(
+    leg: str, side: str, fill_price: float,
+    e: Optional[ExecutionMetrics],
+) -> list[str]:
+    """Format one leg+side execution block. Returns empty if no metrics."""
+    if e is None or e.duration_sec <= 0:
+        return []
+    quote_label = "Ask" if side == "entry" else "Bid"
+    return [
+        f"  {leg.upper()} ({side})",
+        f"    Time to fill: {e.duration_sec:.1f}s, {e.attempts} attempt(s)",
+        f"    Mark at start: ${e.ref_mark:,.2f} -> Fill: ${fill_price:,.2f}",
+        f"    Slippage vs mark: {e.slippage_vs_mark_pct:+.2f}%",
+        f"    {quote_label} at start: ${e.ref_quote:,.2f}  "
+        f"Saved vs taker: ${e.saved_vs_taker_usd:+,.2f}",
+    ]
+
+
+def _format_execution_quality(m: DailyMetrics) -> list[str]:
+    """Build the execution-quality section for the daily report."""
+    blocks: list[str] = []
+
+    entry_blocks = []
+    entry_blocks += _format_exec_block(
+        "put", "entry", m.put_premium_entry, m.put_entry_exec,
+    )
+    entry_blocks += _format_exec_block(
+        "spot", "entry", m.spot_entry, m.spot_entry_exec,
+    )
+    if entry_blocks:
+        blocks.append("<b>Entry execution</b>")
+        blocks += entry_blocks
+
+    exit_blocks = []
+    exit_blocks += _format_exec_block(
+        "spot", "exit", m.spot_exit, m.spot_exit_exec,
+    )
+    exit_blocks += _format_exec_block(
+        "put", "exit", m.put_premium_exit, m.put_exit_exec,
+    )
+    if exit_blocks:
+        if blocks:
+            blocks.append("")
+        blocks.append("<b>Exit execution</b>")
+        blocks += exit_blocks
+
+    if not blocks:
+        return []
+
+    legs = [
+        m.spot_entry_exec, m.put_entry_exec,
+        m.spot_exit_exec, m.put_exit_exec,
+    ]
+    legs = [x for x in legs if x and x.duration_sec > 0]
+    if legs:
+        total_saved = sum(x.saved_vs_taker_usd for x in legs)
+        total_attempts = sum(x.attempts for x in legs)
+        avg_dur = sum(x.duration_sec for x in legs) / len(legs)
+        avg_slip = sum(x.slippage_vs_mark_pct for x in legs) / len(legs)
+        blocks.append("")
+        blocks.append("<b>Execution summary</b>")
+        blocks.append(
+            f"  Avg time to fill: {avg_dur:.1f}s "
+            f"({total_attempts} total attempts across {len(legs)} legs)"
+        )
+        blocks.append(f"  Avg slippage vs mark: {avg_slip:+.2f}%")
+        blocks.append(
+            f"  Total saved vs taker: ${total_saved:+,.2f}"
+        )
+
+    return blocks
 
 
 def format_telegram_report(m: DailyMetrics) -> str:
@@ -305,6 +454,20 @@ def format_telegram_report(m: DailyMetrics) -> str:
     exit_spot_usd = spot_btc * m.spot_exit
     exit_put_usd = put_btc * m.spot_exit
 
+    strike_line = f"  Put strike: ${m.put_strike:,.0f}"
+    if m.spot_entry > 0:
+        strike_line += f"  (spot ${m.spot_entry:,.0f}"
+        if m.spot_exit > 0:
+            strike_line += f" -> ${m.spot_exit:,.0f}"
+        strike_line += ")"
+
+    if m.starting_equity > 0:
+        equity_line = (
+            f"  Equity: ${m.starting_equity:,.2f} -> ${m.equity:,.2f}"
+        )
+    else:
+        equity_line = f"  Equity: ${m.equity + m.trade_pnl:,.2f} → ${m.equity:,.2f}"
+
     lines = [
         f"<b>DAILY REPORT — {m.trade_date}</b>",
         "",
@@ -312,7 +475,7 @@ def format_telegram_report(m: DailyMetrics) -> str:
         f"  P&L: {pnl_sign}${m.trade_pnl:,.2f} ({pnl_sign}{m.trade_return_pct:.2%})",
         f"  Spot: ${m.spot_entry:,.0f} → ${m.spot_exit:,.0f} ({m.spot_move_pct:+.2%})",
         f"  Option: ${m.put_premium_entry:,.2f} → ${m.put_premium_exit:,.2f}",
-        f"  Put strike: ${m.put_strike:,.0f}",
+        strike_line,
         f"  Straddles: {m.num_straddles}",
         "",
         "<b>Volume</b>",
@@ -332,7 +495,7 @@ def format_telegram_report(m: DailyMetrics) -> str:
         f"  Option premium: ${m.put_premium_cost:,.2f}",
         f"    ({config.NUM_PUTS} puts × {config.QTY_PER_LEG} BTC × ${m.put_premium_cost / max(config.NUM_PUTS * config.QTY_PER_LEG * m.num_straddles, 1):,.0f})",
         f"  <b>Total deployed: ${m.total_capital_used:,.2f}</b>",
-        f"  Equity: ${m.equity + m.trade_pnl:,.2f} → ${m.equity:,.2f}",
+        equity_line,
         "",
         "<b>Portfolio</b>",
         f"  Equity: ${m.equity:,.2f}",
@@ -359,6 +522,11 @@ def format_telegram_report(m: DailyMetrics) -> str:
         f"  Expectancy ratio: {m.expectancy_ratio:.2f}",
     ]
 
+    exec_lines = _format_execution_quality(m)
+    if exec_lines:
+        lines.append("")
+        lines.extend(exec_lines)
+
     return "\n".join(lines)
 
 
@@ -379,6 +547,20 @@ def format_telegram_summary(m: DailyMetrics) -> str:
     exit_put_usd = put_btc * m.spot_exit
     exit_total_usd = exit_spot_usd + exit_put_usd
 
+    strike_line = f"  Put strike: ${m.put_strike:,.0f}"
+    if m.spot_entry > 0:
+        strike_line += f"  (spot ${m.spot_entry:,.0f}"
+        if m.spot_exit > 0:
+            strike_line += f" -> ${m.spot_exit:,.0f}"
+        strike_line += ")"
+
+    if m.starting_equity > 0:
+        equity_line = (
+            f"  Equity: ${m.starting_equity:,.2f} -> ${m.equity:,.2f}"
+        )
+    else:
+        equity_line = f"  Equity: ${m.equity:,.2f}"
+
     lines = [
         f"<b>TRADE SUMMARY — {m.trade_date}</b>",
         "",
@@ -386,7 +568,8 @@ def format_telegram_summary(m: DailyMetrics) -> str:
         f"  P&L: {pnl_sign}${m.trade_pnl:,.2f} ({pnl_sign}{m.trade_return_pct:.2%})",
         f"  Spot: ${m.spot_entry:,.0f} → ${m.spot_exit:,.0f}",
         f"  Option: ${m.put_premium_entry:,.2f} → ${m.put_premium_exit:,.2f}",
-        f"  Equity: ${m.equity:,.2f}",
+        strike_line,
+        equity_line,
         "",
         "<b>Volume</b>",
         f"  Straddles: {m.num_straddles}",
@@ -403,6 +586,11 @@ def format_telegram_summary(m: DailyMetrics) -> str:
         f"    Options: ${exit_put_usd:,.0f}",
         f"    Total: {total_btc:.1f} BTC / ${exit_total_usd:,.0f}",
     ]
+
+    exec_lines = _format_execution_quality(m)
+    if exec_lines:
+        lines.append("")
+        lines.extend(exec_lines)
 
     return "\n".join(lines)
 
@@ -523,6 +711,7 @@ def compute_weekly_report(equity: float) -> Optional[DailyMetrics]:
         put_premium_cost=sum(t.put_premium_cost for t in trades),
         total_capital_used=sum(t.total_capital_used for t in trades),
         put_strike=latest.put_strike,
+        starting_equity=trades[0].capital_before if trades else 0.0,
     )
 
 
