@@ -37,6 +37,58 @@ log = structlog.get_logger(__name__)
 _SESSION_PREFIX = {"afternoon": "A", "morning": "M"}
 
 
+def _format_leg_fill_message(
+    *,
+    leg: str,
+    side: str,
+    straddle_id: str,
+    symbol: str,
+    qty_btc: float,
+    fill_price: float,
+    metrics: dict | None = None,
+    order_id: str = "",
+    fully_filled: bool = True,
+) -> str:
+    """Format a per-leg Telegram fill message with execution-quality metrics.
+
+    Mirrors the OKX `_format_leg_fill_message` so operators see consistent
+    fill telemetry across both desks.
+    """
+    metrics = metrics or {}
+    mark = float(metrics.get("ref_mark", 0) or 0)
+    slip = float(metrics.get("slippage_vs_mark_pct", 0) or 0)
+    duration = float(metrics.get("duration_sec", 0) or 0)
+    attempts = int(metrics.get("attempts", 0) or 0)
+    saved_usd = float(metrics.get("saved_vs_taker_total_usd", 0) or 0)
+
+    header = f"LEG {'FILLED' if side == 'entry' else 'UNWOUND'} — {leg}"
+    fill_line = f"Avg fill: ${fill_price:,.2f}"
+    if mark > 0:
+        fill_line += f"  (mark ${mark:,.2f})"
+    slip_line = (
+        f"Slippage vs mark: {slip:+.2f}%"
+        if mark > 0 else "Slippage vs mark: n/a"
+    )
+    timing_line = f"Time to fill: {duration:.1f}s, attempts: {attempts}"
+    saved_line = (
+        f"Saved vs taker: ${saved_usd:+.2f}"
+        if saved_usd != 0 else "Saved vs taker: $0.00"
+    )
+    qty_line = f"Filled qty: {qty_btc:.4f} BTC"
+    fully_line = "" if fully_filled else "  PARTIAL"
+
+    return (
+        f"<b>{header}</b>{fully_line} [{straddle_id}]\n"
+        f"Symbol: {symbol}\n"
+        f"{fill_line}\n"
+        f"{slip_line}\n"
+        f"{timing_line}\n"
+        f"{qty_line}\n"
+        f"{saved_line}\n"
+        f"Order id: {order_id}"
+    )
+
+
 async def build_straddle(
     exchange: BybitExchange,
     market: MarketData,
@@ -131,13 +183,26 @@ async def build_straddle(
             return None
 
         fill_price = float(result.get("avgPrice", put_bid))
+        leg_metrics = result.get("metrics", {}) or {}
         put_legs.append(StraddleLeg(
             instrument=put.symbol, side="Buy",
             qty=total_put_qty, entry_price=fill_price,
             order_id=result.get("orderId", ""), avg_fill_price=fill_price,
-            entry_metrics=result.get("metrics", {}) or {},
+            entry_metrics=leg_metrics,
         ))
         log.info("put_filled", id=straddle_id, leg=i + 1, price=fill_price)
+
+        await notifier.send(_format_leg_fill_message(
+            leg=f"PUT {i + 1}/{config.NUM_PUTS}",
+            side="entry",
+            straddle_id=straddle_id,
+            symbol=put.symbol,
+            qty_btc=total_put_qty,
+            fill_price=fill_price,
+            metrics=leg_metrics,
+            order_id=result.get("orderId", ""),
+            fully_filled=True,
+        ))
 
     # ── Step 4: Buy spot (easy leg, fills within seconds) ──
     try:
@@ -168,12 +233,25 @@ async def build_straddle(
     spot_fill = float(spot_result.get("avgPrice", 0)) or spot_price
     log.info("spot_filled", id=straddle_id, price=spot_fill, order_id=spot_order_id)
 
+    spot_metrics = spot_result.get("metrics", {}) or {}
     spot_leg = StraddleLeg(
         instrument=config.SPOT_SYMBOL, side="Buy",
         qty=total_spot_qty, entry_price=spot_fill,
         order_id=spot_order_id, avg_fill_price=spot_fill,
-        entry_metrics=spot_result.get("metrics", {}) or {},
+        entry_metrics=spot_metrics,
     )
+
+    await notifier.send(_format_leg_fill_message(
+        leg="SPOT",
+        side="entry",
+        straddle_id=straddle_id,
+        symbol=config.SPOT_SYMBOL,
+        qty_btc=total_spot_qty,
+        fill_price=spot_fill,
+        metrics=spot_metrics,
+        order_id=spot_order_id,
+        fully_filled=True,
+    ))
 
     # ── Step 5: Register straddle ──
     avg_put_price = sum(p.avg_fill_price for p in put_legs) / len(put_legs)
@@ -223,32 +301,65 @@ async def unwind_straddle(
     if straddle is None:
         return 0.0
 
+    from core import notifier
+
     log.info("unwinding", id=straddle.id, reason=reason)
 
     # ── Sell spot (GTC limit at ask — maker) ──
+    spot_exit_fill = 0.0
+    spot_exit_metrics: dict = {}
+    spot_exit_order_id = ""
     try:
         sell_result = await exchange.sell_spot(straddle.spot_leg.qty)
         if not sell_result or not sell_result.get("orderId"):
             log.error("spot_sell_chase_exhausted", id=straddle.id)
         else:
-            straddle.spot_leg.exit_metrics = sell_result.get("metrics", {}) or {}
+            spot_exit_metrics = sell_result.get("metrics", {}) or {}
+            spot_exit_order_id = sell_result.get("orderId", "")
+            spot_exit_fill = float(sell_result.get("avgPrice", 0) or 0)
+            straddle.spot_leg.exit_metrics = spot_exit_metrics
     except Exception as exc:
         log.error("spot_sell_failed", id=straddle.id, error=str(exc))
 
     exit_spot = await market.get_spot_price()
+    if spot_exit_order_id:
+        await notifier.send(_format_leg_fill_message(
+            leg="SPOT",
+            side="exit",
+            straddle_id=straddle.id,
+            symbol=config.SPOT_SYMBOL,
+            qty_btc=straddle.spot_leg.qty,
+            fill_price=spot_exit_fill or exit_spot,
+            metrics=spot_exit_metrics,
+            order_id=spot_exit_order_id,
+            fully_filled=True,
+        ))
 
     # ── Sell all put legs (maker chase) ──
     exit_put_price = 0.0
     put_prices: list[float] = []
-    for pl in straddle.put_legs:
+    for idx, pl in enumerate(straddle.put_legs):
         _, ask = await market.get_option_bid_ask(pl.instrument)
         if ask > 0:
             result = await exchange.chase_sell_put(pl.instrument, pl.qty, ask)
             if result:
                 price = float(result.get("avgPrice", ask))
                 put_prices.append(price)
-                pl.exit_metrics = result.get("metrics", {}) or {}
+                exit_metrics = result.get("metrics", {}) or {}
+                pl.exit_metrics = exit_metrics
                 log.info("put_sold", instrument=pl.instrument, price=price)
+
+                await notifier.send(_format_leg_fill_message(
+                    leg=f"PUT {idx + 1}/{len(straddle.put_legs)}",
+                    side="exit",
+                    straddle_id=straddle.id,
+                    symbol=pl.instrument,
+                    qty_btc=pl.qty,
+                    fill_price=price,
+                    metrics=exit_metrics,
+                    order_id=result.get("orderId", ""),
+                    fully_filled=(result.get("orderStatus") == "Filled"),
+                ))
 
                 remaining_pos = await exchange.get_option_position(pl.instrument)
                 if remaining_pos > 0:
