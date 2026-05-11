@@ -1,24 +1,34 @@
-# Bybit 0DTE BTC Synthetic Straddle — Session 3
+# Bybit 0DTE BTC Synthetic Straddle — Multi-Session
 
 Automated trading bot that executes a **long-gamma synthetic straddle** strategy on BTC 0DTE (zero-days-to-expiration) options via the **Bybit V5 API**.
 
 ## Strategy Overview
 
-The bot runs a single daily session (12:00–16:00 UTC, Monday to Friday) and constructs synthetic long straddles:
+The bot runs **two sessions per trading day** (10 trades per week) and constructs synthetic long straddles:
 
 | Leg | Instrument | Direction | Purpose |
 |-----|-----------|-----------|---------|
 | Spot | BTCUSDT spot (10× margin) | Long | Delta-one BTC exposure |
-| Puts | 2 × 0.5 BTC ITM 0DTE puts (USDT-settled) | Long | Downside protection + long gamma |
+| Puts | 2 × `qty_per_leg` BTC ITM 0DTE puts (USDT-settled) | Long | Downside protection + long gamma |
 
 A synthetic straddle replicates the payoff of being long both a call and a put — profiting from **large moves in either direction** while the premium paid (put cost + margin) is the max loss.
 
-### Daily Workflow
+### Schedule
 
-1. **12:00 UTC** — Algo sizes the position based on 80% of current equity (compound growth), runs a pre-flight capital check to ensure enough funds for complete straddles, then enters:
-   - Buys BTC spot on margin (GTC limit at bid — maker)
-   - Buys 2 ITM put options per straddle (GTC limit at bid — maker)
-2. **16:00 UTC** — Hard close: sells all spot then sells all puts. No early exit.
+| Session | Window (UTC) | Days (UTC) | qty_per_leg | Notes |
+|---|---|---|---|---|
+| afternoon (1st entry) | 13:30–15:30 | Mon–Fri | 0.25 BTC | Targets next-day 08:00 UTC expiry |
+| morning (2nd entry) | 01:00–02:00 | Tue–Sat | 0.25 BTC | Targets same-day 08:00 UTC expiry |
+
+Both sessions of one trading day share the **same 08:00 UTC option expiry** — e.g. Monday afternoon (13:30 UTC) and Tuesday morning (01:00 UTC) both target Tuesday's 08:00 UTC expiry, and roll up into the **Tuesday trading-day report**.
+
+The position is held continuously within each session window (no take-profit; hard close at the close time).
+
+### Reports
+
+* **Daily report** — chained off the **morning close** (Tue–Sat ~02:00 UTC). Aggregates both sessions of the trading day. Risk Metrics & Edge sections removed per the live config.
+* **Weekly report** — chained off the **Saturday morning close** (~02:00 UTC). Covers the full Mon→Sat trading-week window.
+* No standalone DAILY SUMMARY message — replaced by the daily report.
 
 ### Execution Details
 
@@ -127,13 +137,15 @@ This connects to Bybit Demo (real market data, simulated fills), runs the full a
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `SPOT_LEVERAGE` | 10 | Spot cross-margin leverage |
-| `QTY_PER_LEG` | 0.5 BTC | BTC per leg per straddle |
+| `AFTERNOON_QTY_PER_LEG` | 0.25 BTC | qty/leg for afternoon session (13:30–15:30 UTC) |
+| `MORNING_QTY_PER_LEG` | 0.25 BTC | qty/leg for morning session (01:00–02:00 UTC) |
 | `NUM_PUTS` | 2 | Put contracts per straddle |
-| `ALLOC_PCT` | 0.60 | 60% of equity allocated per session |
-| `INITIAL_CAPITAL_USD` | 7,900 | Starting equity for compound tracking |
-| `SESSION_ENTRY_UTC` | 12:00 | Daily entry time |
-| `SESSION_CLOSE_UTC` | 16:00 | Daily hard close time |
-| `MAX_DAILY_LOSS_PCT` | None | Daily loss halt disabled (set to e.g. 0.10 to enable) |
+| `NUM_STRADDLES_OVERRIDE` | 1 | Force exactly this many straddles per session. `0` = compound sizing |
+| `ALLOC_PCT` | 0.80 | Compound mode: % of current equity per session (only used when override = 0) |
+| `INITIAL_CAPITAL_USD` | 8,000 | Starting equity for compound tracking |
+| `SESSIONS` | (afternoon, morning) | Multi-session list — see config.py |
+| `MAX_DAILY_LOSS_PCT` | None | Daily loss halt disabled |
+| `RESET_STATE_ON_BOOT` | false | One-shot wipe of state files (auto-disables after running) |
 
 ## Margin Methodology
 
@@ -250,11 +262,11 @@ Current rates are visible on Bybit's [Margin Data page](https://www.bybit.com/an
 
 ## Execution Algorithm
 
-### Entry Sequence (12:00 UTC)
+### Entry Sequence (per session)
 
-1. **Refresh 0DTE option chain** — fetch all USDT-settled puts expiring today
+1. **Refresh 0DTE option chain** — fetch all USDT-settled puts for the trading day's 08:00 UTC expiry
 2. **Select ITM put** — scan from nearest ITM strike upward, pick first with bid/ask spread < 10%
-3. **Pre-flight sizing** — compute capital for N complete straddles within 60% of equity
+3. **Pre-flight sizing** — compute capital for `NUM_STRADDLES_OVERRIDE` straddles (or compound sizing if override = 0)
 4. **Buy spot** (GTC limit at bid for maker rebate):
    - Post limit buy at current bid price
    - Wait up to 1 second for fill
@@ -268,11 +280,11 @@ Current rates are visible on Bybit's [Margin Data page](https://www.bybit.com/an
    - 2 put legs per straddle, each QTY_PER_LEG BTC
 6. If any leg fails, all previously filled legs are unwound immediately
 
-### Exit Sequence (16:00 UTC)
+### Exit Sequence (per session close)
 
 1. **Sell spot first** — GTC limit at ask, same chase logic as entry
 2. **Sell puts** — GTC limit at ask, same chase logic as entry
-3. Log trade, update equity, generate and send daily report via Telegram
+3. Log trade, update equity. If this is the **morning close** (LAST_CLOSE_SESSION_NAME), the daily report is sent immediately. On Saturday, the weekly report is also chained.
 
 ### Order Types
 

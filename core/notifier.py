@@ -2,7 +2,11 @@
 
 Two channels:
   - Ops chat (TELEGRAM_CHAT_ID): startup, pre-flight, entry, close, errors
-  - Report chat (TELEGRAM_REPORT_CHAT_ID): slim daily report only
+  - Report chat (TELEGRAM_REPORT_CHAT_ID): daily / weekly reports
+
+Multi-session: entry/close messages accept an optional session_label
+(e.g. '13:30-15:30 UTC') which is prefixed in the header so you can
+distinguish afternoon vs morning at a glance.
 """
 from __future__ import annotations
 
@@ -15,8 +19,8 @@ import config
 
 log = structlog.get_logger(__name__)
 
+
 async def _send_to(bot_token: str, chat_id: str, text: str) -> None:
-    """Send a message using a specific bot token and chat ID."""
     if not bot_token or not chat_id:
         log.debug("telegram_disabled", chat_id=chat_id, msg=text[:80])
         return
@@ -45,14 +49,24 @@ async def send_report(text: str) -> None:
     await _send_to(bot, chat, text)
 
 
+def _label_suffix(session_label: str) -> str:
+    return f" [{session_label}]" if session_label else ""
+
+
 async def notify_entry(
     num_straddles: int, equity: float, straddle_cost: float,
     spot_fill: float, strike: float, put_premium: float,
     spot_margin_used: float, put_cost_total: float,
+    qty_per_leg: float | None = None,
+    session_label: str = "",
 ) -> None:
+    qty_line = (
+        f"BTC per leg: {qty_per_leg:.4f}\n" if qty_per_leg is not None else ""
+    )
     await send(
-        f"<b>SESSION ENTRY</b>\n"
+        f"<b>SESSION ENTRY</b>{_label_suffix(session_label)}\n"
         f"Straddles: {num_straddles}\n"
+        f"{qty_line}"
         f"Equity: ${equity:,.2f}\n"
         f"\n<b>Fills</b>\n"
         f"Spot: ${spot_fill:,.2f}\n"
@@ -65,47 +79,45 @@ async def notify_entry(
     )
 
 
-async def notify_close(pnl: float, exit_reason: str) -> None:
+async def notify_close(
+    pnl: float, exit_reason: str, session_label: str = "",
+) -> None:
     pnl_sign = "+" if pnl >= 0 else ""
     await send(
-        f"<b>SESSION CLOSE</b>\n"
+        f"<b>SESSION CLOSE</b>{_label_suffix(session_label)}\n"
         f"P&L: {pnl_sign}${pnl:,.2f}\n"
     )
 
 
-async def notify_skip(reason: str) -> None:
-    await send(f"<b>SKIPPED</b>\n{reason}")
+async def notify_skip(reason: str, session_label: str = "") -> None:
+    await send(f"<b>SKIPPED</b>{_label_suffix(session_label)}\n{reason}")
 
 
 async def notify_error(context: str, message: str) -> None:
     await send(f"<b>ERROR</b> [{context}]\n{message}")
 
 
-async def notify_daily_summary(equity: float, daily_pnl: float, cum_return: float) -> None:
-    await send(
-        f"<b>DAILY SUMMARY</b>\n"
-        f"Equity: ${equity:,.2f}\n"
-        f"Today P&L: ${daily_pnl:,.2f}\n"
-        f"Cumulative return: {cum_return:.1%}\n"
-    )
-
-
 async def send_daily_report(equity: float) -> None:
-    """Generate and send the slim Trade Summary to the report group chat."""
-    from reporting.daily_report import compute_report, format_telegram_summary
+    """Generate and send the FULL daily report (no risk metrics / no edge)
+    to the report group chat.
+
+    Chained off the morning session's close handler in main._on_close.
+    """
+    from reporting.daily_report import compute_report, format_telegram_report
     try:
         metrics = compute_report(equity)
         if metrics is None:
-            log.info("daily_report_skipped", reason="no trades in log")
+            log.info("daily_report_skipped", reason="no trades for trading day")
             return
-        await send_report(format_telegram_summary(metrics))
-        log.info("daily_report_sent", trades=metrics.total_trades, sharpe=f"{metrics.sharpe_ratio:.2f}")
+        await send_report(format_telegram_report(metrics))
+        log.info("daily_report_sent", trades=metrics.total_trades,
+                 sharpe=f"{metrics.sharpe_ratio:.2f}")
     except Exception:
         log.warning("daily_report_failed", exc_info=True)
 
 
 async def send_weekly_report(equity: float) -> None:
-    """Generate and send the weekly report to the report group chat."""
+    """Generate and send the weekly report. Chained off Saturday morning close."""
     from reporting.daily_report import compute_weekly_report, format_weekly_report
     try:
         metrics = compute_weekly_report(equity)
@@ -113,6 +125,7 @@ async def send_weekly_report(equity: float) -> None:
             log.info("weekly_report_skipped", reason="no trades this week")
             return
         await send_report(format_weekly_report(metrics))
-        log.info("weekly_report_sent", trades=metrics.total_trades, pnl=f"${metrics.trade_pnl:,.2f}")
+        log.info("weekly_report_sent", trades=metrics.total_trades,
+                 pnl=f"${metrics.trade_pnl:,.2f}")
     except Exception:
         log.warning("weekly_report_failed", exc_info=True)

@@ -1,9 +1,10 @@
 """
 Atomic straddle construction and teardown.
 
-One straddle = 0.5 BTC spot margin (long) + 2 × 0.5 BTC ITM put (long).
+One straddle = qty_per_leg BTC spot margin (long) + NUM_PUTS × qty_per_leg
+BTC ITM puts (long). Default qty_per_leg = 0.25 BTC for both sessions.
 
-Entry (NEW — hard leg first):
+Entry (hard leg first):
   1. Pre-entry spread gate — skip session if put spread > OPTION_MAX_ENTRY_SPREAD_PCT
   2. Buy puts FIRST (illiquid leg) — maker chase with 50% gap-narrowing + fair-value cap
   3. If puts fail → skip session (no spot bought, no exposure)
@@ -18,6 +19,7 @@ import asyncio
 import csv
 import os
 import uuid
+from datetime import datetime
 from typing import Optional
 
 import structlog
@@ -32,30 +34,35 @@ from utils.time_utils import now_utc
 log = structlog.get_logger(__name__)
 
 
+_SESSION_PREFIX = {"afternoon": "A", "morning": "M"}
+
+
 async def build_straddle(
     exchange: BybitExchange,
     market: MarketData,
     portfolio: Portfolio,
     put: OptionInfo,
     num_straddles: int,
+    qty_per_leg: float | None = None,
+    session_name: str = "",
 ) -> Optional[Straddle]:
     """
     Execute the atomic entry for N identical straddle units.
 
-    NEW ORDER (hard leg first):
-      1. Pre-entry spread gate
-      2. Buy puts (NUM_PUTS legs, each QTY_PER_LEG × num_straddles BTC)
-      3. If puts fail → skip session, no spot exposure
-      4. Buy spot (margin): QTY_PER_LEG × num_straddles BTC
-      5. If spot fails → roll back puts only
-      6. Register straddle in portfolio
+    Args:
+        qty_per_leg:   BTC notional for the spot leg. Defaults to
+                       config.QTY_PER_LEG when None.
+        session_name:  "afternoon" / "morning" / "" — propagated into the
+                       Straddle for trade-log tagging.
     """
     from core import notifier
 
-    straddle_id = f"S3-{uuid.uuid4().hex[:8]}"
+    qty = qty_per_leg if qty_per_leg is not None else config.QTY_PER_LEG
+    prefix = _SESSION_PREFIX.get(session_name, "S")
+    straddle_id = f"S3-{prefix}-{uuid.uuid4().hex[:8]}"
     spot_price = await market.get_spot_price()
-    total_spot_qty = config.QTY_PER_LEG * num_straddles
-    total_put_qty = config.QTY_PER_LEG * num_straddles
+    total_spot_qty = qty * num_straddles
+    total_put_qty = qty * num_straddles
 
     log.info("building_straddle", id=straddle_id, spot=spot_price,
              put=put.symbol, strike=put.strike, num=num_straddles)
@@ -170,26 +177,33 @@ async def build_straddle(
 
     # ── Step 5: Register straddle ──
     avg_put_price = sum(p.avg_fill_price for p in put_legs) / len(put_legs)
-    total_put_cost = config.NUM_PUTS * config.QTY_PER_LEG * avg_put_price
-    straddle_cost = (config.QTY_PER_LEG * spot_fill / config.SPOT_LEVERAGE) + total_put_cost
+    total_put_cost = config.NUM_PUTS * qty * avg_put_price
+    straddle_cost = (qty * spot_fill / config.SPOT_LEVERAGE) + total_put_cost
+
+    entry_dt = now_utc()
+    trading_day = config.trading_day_for(entry_dt).isoformat()
 
     straddle = Straddle(
         id=straddle_id,
         spot_leg=spot_leg,
         put_legs=put_legs,
         put_strike=put.strike,
-        spot_qty=config.QTY_PER_LEG,
-        put_qty_each=config.QTY_PER_LEG,
-        entry_time=now_utc().isoformat(),
+        spot_qty=qty,
+        put_qty_each=qty,
+        entry_time=entry_dt.isoformat(),
         entry_spot=spot_fill,
         entry_put_price=avg_put_price,
         total_put_cost=total_put_cost,
         straddle_cost=straddle_cost,
         num_straddles=num_straddles,
+        session_name=session_name,
+        trading_day=trading_day,
     )
 
     portfolio.set_straddle(straddle)
     log.info("straddle_built", id=straddle_id, num=num_straddles,
+             session=session_name, qty_per_leg=qty,
+             trading_day=trading_day,
              cost=f"${straddle_cost * num_straddles:,.2f}",
              spot=spot_fill, put_premium=avg_put_price, strike=put.strike)
     return straddle
@@ -445,16 +459,22 @@ def _log_rollback_trade(
     put_entry_price: float,
     put_exit_price: float,
     put_qty: float,
+    session_name: str = "",
 ) -> None:
     """Write a row to trade_log.csv for a puts-only rollback."""
-    entry_time = now_utc().isoformat()
+    entry_dt = now_utc()
+    entry_time = entry_dt.isoformat()
+    trading_day = config.trading_day_for(entry_dt).isoformat()
 
     row = {
         "date": entry_time[:10],
+        "trading_day": trading_day,
+        "session": session_name,
         "entry_time": entry_time,
         "exit_time": entry_time,
         "exit_reason": "rollback_puts_only",
         "num_straddles": 0,
+        "qty_per_leg": 0,
         "spot_entry": 0,
         "spot_exit": 0,
         "put_strike": 0,
@@ -496,18 +516,28 @@ def _log_emergency_trade(
     spot_pnl: float,
     put_pnl: float,
     net_pnl: float,
+    session_name: str = "",
 ) -> None:
     """Write a row to trade_log.csv for the emergency unwind."""
     equity_before = portfolio.equity
     portfolio.adjust_equity(net_pnl)
     equity_after = portfolio.equity
 
+    try:
+        entry_dt = datetime.fromisoformat(entry_time)
+    except Exception:
+        entry_dt = now_utc()
+    trading_day = config.trading_day_for(entry_dt).isoformat()
+
     row = {
         "date": entry_time[:10],
+        "trading_day": trading_day,
+        "session": session_name,
         "entry_time": entry_time,
         "exit_time": now_utc().isoformat(),
         "exit_reason": "emergency_unwind",
         "num_straddles": 0,
+        "qty_per_leg": spot_qty,
         "spot_entry": spot_entry,
         "spot_exit": spot_exit,
         "put_strike": 0,

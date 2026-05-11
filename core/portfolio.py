@@ -2,6 +2,10 @@
 Equity tracking, position state, and trade logging.
 
 Compound sizing: equity grows/shrinks with each trade's realised P&L.
+
+Multi-session: Straddle now carries `session_name`, `qty_per_leg`,
+`trading_day` (YYYY-MM-DD of the 08:00 UTC option expiry) so daily
+reports can group both sessions of a trading day together.
 """
 from __future__ import annotations
 
@@ -20,8 +24,9 @@ from utils.time_utils import now_utc
 log = structlog.get_logger(__name__)
 
 TRADE_LOG_FIELDS = [
-    "date", "entry_time", "exit_time", "exit_reason",
-    "num_straddles", "spot_entry", "spot_exit",
+    "date", "trading_day", "session", "entry_time", "exit_time", "exit_reason",
+    "num_straddles", "qty_per_leg",
+    "spot_entry", "spot_exit",
     "put_strike", "put_premium_entry", "put_premium_exit",
     "spot_margin_used", "put_premium_cost", "total_capital_used",
     "straddle_cost", "capital_before",
@@ -56,8 +61,6 @@ class StraddleLeg:
     entry_price: float
     order_id: str = ""
     avg_fill_price: float = 0.0
-    # Execution-quality metrics, captured at fill time. See
-    # core.exchange._build_fill_metrics for the keys produced.
     entry_metrics: dict = field(default_factory=dict)
     exit_metrics: dict = field(default_factory=dict)
 
@@ -69,16 +72,20 @@ class StraddleLeg:
 class Straddle:
     id: str
     spot_leg: StraddleLeg
-    put_legs: list[StraddleLeg]        # NUM_PUTS put legs
+    put_legs: list[StraddleLeg]
     put_strike: float
-    spot_qty: float                     # QTY_PER_LEG
-    put_qty_each: float                 # QTY_PER_LEG per put leg
+    spot_qty: float                     # qty_per_leg (BTC) for spot
+    put_qty_each: float                 # qty_per_leg (BTC) per put leg
     entry_time: str
     entry_spot: float
-    entry_put_price: float              # per-BTC put premium at entry
-    total_put_cost: float               # NUM_PUTS × QTY_PER_LEG × put_premium
-    straddle_cost: float                # margin + total_put_cost
-    num_straddles: int                  # how many of this unit were opened
+    entry_put_price: float
+    total_put_cost: float
+    straddle_cost: float
+    num_straddles: int
+
+    # Multi-session metadata
+    session_name: str = ""
+    trading_day: str = ""
 
     status: str = "open"
     exit_time: Optional[str] = None
@@ -113,6 +120,8 @@ class Straddle:
             "total_put_cost": self.total_put_cost,
             "straddle_cost": self.straddle_cost,
             "num_straddles": self.num_straddles,
+            "session_name": self.session_name,
+            "trading_day": self.trading_day,
             "status": self.status,
             "exit_time": self.exit_time,
             "exit_spot": self.exit_spot,
@@ -122,20 +131,20 @@ class Straddle:
 
 
 class Portfolio:
-    """Tracks equity and the current open straddle (at most one per day)."""
+    """Tracks equity and the current open straddle (at most one at a time)."""
 
     def __init__(self) -> None:
         self._equity: float = config.INITIAL_CAPITAL_USD
         self._straddle: Optional[Straddle] = None
         self._daily_pnl: float = 0.0
         self._load_equity()
+        self._migrate_trade_log()
 
     @property
     def equity(self) -> float:
         return self._equity
 
     def sync_equity(self, live_equity: float) -> None:
-        """Sync internal equity with the live Bybit wallet balance."""
         if live_equity <= 0:
             log.warning("sync_equity_skipped", live_equity=live_equity)
             return
@@ -146,7 +155,6 @@ class Portfolio:
                  delta=f"${live_equity - old:,.2f}")
 
     def adjust_equity(self, delta: float) -> None:
-        """Apply an equity adjustment (e.g. emergency unwind P&L) and persist."""
         self._equity += delta
         self._daily_pnl += delta
         self._save_equity()
@@ -223,9 +231,6 @@ class Portfolio:
         put_cost = s.total_put_cost * s.num_straddles
         total_capital_used = spot_margin + put_cost
 
-        # Per-leg execution metrics — spot has one leg; puts have NUM_PUTS
-        # legs which we aggregate (mean duration/attempts/slippage, sum
-        # saved_vs_taker so the dollar amount is the total across legs).
         se = s.spot_leg.entry_metrics or {}
         sx = s.spot_leg.exit_metrics or {}
         pe_metrics = [pl.entry_metrics for pl in s.put_legs if pl.entry_metrics]
@@ -243,12 +248,24 @@ class Portfolio:
             vals = [int(m.get(key, 0) or 0) for m in items]
             return max(vals) if vals else 0
 
+        # Resolve trading_day if not set on the straddle.
+        trading_day = s.trading_day
+        if not trading_day:
+            try:
+                entry_dt = datetime.fromisoformat(s.entry_time)
+                trading_day = config.trading_day_for(entry_dt).isoformat()
+            except Exception:
+                trading_day = s.entry_time[:10]
+
         row = {
             "date": s.entry_time[:10],
+            "trading_day": trading_day,
+            "session": s.session_name,
             "entry_time": s.entry_time,
             "exit_time": s.exit_time,
             "exit_reason": exit_reason,
             "num_straddles": s.num_straddles,
+            "qty_per_leg": s.spot_qty,
             "spot_entry": s.entry_spot,
             "spot_exit": s.exit_spot,
             "put_strike": s.put_strike,
@@ -265,28 +282,24 @@ class Portfolio:
             "fees": 0.0,
             "net_pnl": s.pnl,
             "capital_after": self._equity,
-            # Spot leg — entry
             "spot_entry_duration_sec": se.get("duration_sec", ""),
             "spot_entry_attempts": se.get("attempts", ""),
             "spot_entry_ref_mark": se.get("ref_mark", ""),
             "spot_entry_ref_ask": se.get("ref_ask", ""),
             "spot_entry_slippage_vs_mark_pct": se.get("slippage_vs_mark_pct", ""),
             "spot_entry_saved_vs_taker_usd": se.get("saved_vs_taker_total_usd", ""),
-            # Put legs — entry (averaged across NUM_PUTS legs)
             "put_entry_duration_sec": _avg(pe_metrics, "duration_sec"),
             "put_entry_attempts": _max_int(pe_metrics, "attempts"),
             "put_entry_ref_mark": _avg(pe_metrics, "ref_mark"),
             "put_entry_ref_ask": _avg(pe_metrics, "ref_ask"),
             "put_entry_slippage_vs_mark_pct": _avg(pe_metrics, "slippage_vs_mark_pct"),
             "put_entry_saved_vs_taker_usd": _sum(pe_metrics, "saved_vs_taker_total_usd"),
-            # Spot leg — exit
             "spot_exit_duration_sec": sx.get("duration_sec", ""),
             "spot_exit_attempts": sx.get("attempts", ""),
             "spot_exit_ref_mark": sx.get("ref_mark", ""),
             "spot_exit_ref_bid": sx.get("ref_bid", ""),
             "spot_exit_slippage_vs_mark_pct": sx.get("slippage_vs_mark_pct", ""),
             "spot_exit_saved_vs_taker_usd": sx.get("saved_vs_taker_total_usd", ""),
-            # Put legs — exit
             "put_exit_duration_sec": _avg(px_metrics, "duration_sec"),
             "put_exit_attempts": _max_int(px_metrics, "attempts"),
             "put_exit_ref_mark": _avg(px_metrics, "ref_mark"),
@@ -300,10 +313,6 @@ class Portfolio:
             with open(config.TRADE_LOG_FILE, "r") as f:
                 existing_header = f.readline().strip().split(",")
             if existing_header != TRADE_LOG_FIELDS:
-                # _rewrite_csv_header already writes the new header to the
-                # migrated file, so we must NOT re-write it before appending
-                # this trade — otherwise the CSV ends up with a duplicate
-                # header row mid-file that breaks DictReader on read.
                 log.warning("trade_log_schema_mismatch", rewriting_header=True)
                 self._rewrite_csv_header(existing_header)
                 needs_header = False
@@ -314,10 +323,44 @@ class Portfolio:
                 writer.writeheader()
             writer.writerow(row)
 
+    # ──────────────── CSV migration helpers ──────────────────────
+
+    def _migrate_trade_log(self) -> None:
+        """One-shot in-place migration to the current TRADE_LOG_FIELDS schema.
+
+        Adds any missing columns (notably trading_day, session, qty_per_leg)
+        with sensible defaults so old rows remain readable by the new
+        DictReader-based loaders.
+        """
+        path = config.TRADE_LOG_FILE
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                first = f.readline().strip()
+            if not first:
+                return
+            existing_header = first.split(",")
+            if existing_header == TRADE_LOG_FIELDS:
+                return
+            self._rewrite_csv_header(existing_header)
+            added = [c for c in TRADE_LOG_FIELDS if c not in existing_header]
+            try:
+                with open(path) as f:
+                    rows = sum(1 for _ in f) - 1
+            except Exception:
+                rows = -1
+            log.info("trade_log_migrated", path=path, added_columns=added, rows=rows)
+        except Exception:
+            log.warning("trade_log_migration_failed", exc_info=True)
+
     @staticmethod
     def _rewrite_csv_header(old_fields: list[str]) -> None:
-        """Rewrite the CSV with the canonical header, re-mapping old rows by position."""
-        import tempfile
+        """Rewrite the CSV with the canonical header, re-mapping old rows by name.
+
+        Backfills `trading_day` from `date` for rows that pre-date the
+        multi-session schema.
+        """
         import shutil
 
         path = config.TRADE_LOG_FILE
@@ -328,12 +371,29 @@ class Portfolio:
             writer.writeheader()
             next(reader)  # skip old header
             for values in reader:
+                if not values:
+                    continue
                 if len(values) == len(old_fields):
                     row = dict(zip(old_fields, values))
                 elif len(values) == len(TRADE_LOG_FIELDS):
                     row = dict(zip(TRADE_LOG_FIELDS, values))
                 else:
-                    continue
+                    # Best-effort: zip what we have, leave the rest empty.
+                    row = dict(zip(old_fields, values))
                 padded = {f: row.get(f, "") for f in TRADE_LOG_FIELDS}
+                # Backfill trading_day: prefer parsing entry_time so we can
+                # apply the 08:00 UTC cutoff; fall back to date.
+                if not padded.get("trading_day"):
+                    entry_time = row.get("entry_time", "")
+                    derived = ""
+                    if entry_time:
+                        try:
+                            entry_dt = datetime.fromisoformat(entry_time)
+                            derived = config.trading_day_for(entry_dt).isoformat()
+                        except Exception:
+                            derived = ""
+                    padded["trading_day"] = derived or row.get("date", "")
+                if padded.get("qty_per_leg") in ("", None):
+                    padded["qty_per_leg"] = config.QTY_PER_LEG
                 writer.writerow(padded)
         shutil.move(tmp, path)
