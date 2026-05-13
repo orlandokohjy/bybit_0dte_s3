@@ -803,6 +803,37 @@ class BybitExchange:
             await asyncio.sleep(0.5)
         return {}
 
+    async def _read_option_order(self, symbol: str, order_id: str) -> dict:
+        """One-shot read of an option order's status.
+
+        Checks open orders first (still resting), falls back to order
+        history (terminal). Used by chase_buy_put / chase_sell_put for
+        keep-alive iteration without cancel-replace.
+        """
+        if not order_id:
+            return {}
+        try:
+            data = await self._call(
+                self._http.get_open_orders,
+                category="option", symbol=symbol, orderId=order_id,
+            )
+            open_list = data["result"]["list"]
+            if open_list:
+                return open_list[0]
+        except Exception:
+            pass
+        try:
+            data = await self._call(
+                self._http.get_order_history,
+                category="option", symbol=symbol, orderId=order_id,
+            )
+            hist = data["result"]["list"]
+            if hist:
+                return hist[0]
+        except Exception:
+            pass
+        return {}
+
     async def get_order_status(self, category: str, symbol: str, order_id: str) -> dict | None:
         try:
             data = await self._call(
@@ -831,8 +862,8 @@ class BybitExchange:
         self, symbol: str, qty: float, initial_bid: float,
     ) -> dict | None:
         """
-        Maker-only persistent buy with 50% bid-ask gap narrowing and
-        a fair-value cap derived from the option mark price.
+        Maker-only persistent buy with 50% bid-ask gap narrowing, fair-value
+        cap, and queue-priority preservation (added 2026-05-13).
 
         Strategy:
           - Start at the current bid (or initial_bid if WS not ready).
@@ -841,6 +872,13 @@ class BybitExchange:
           - Never post above mark × OPTION_CHASE_MAX_SLIPPAGE_FACTOR
             (default 1.15).
           - Bail when OPTION_CHASE_DEADLINE_SEC expires — no taker fallback.
+
+        Queue priority:
+          - If the recomputed price equals the resting order's price, the
+            chase keeps the order alive (no cancel-replace) so we don't
+            forfeit FIFO position at that price level.
+          - Reprice (price changed) cancels the resting order, credits any
+            partial fills, and posts a fresh order at the new price.
 
         Partial fills accumulate. On full fill returns the filled order
         dict; on partial fill at deadline returns a synthetic dict with
@@ -865,6 +903,12 @@ class BybitExchange:
         ref_bid = ref_ask = ref_mark = 0.0
         captured_ref = False
 
+        # Resting-order state across iterations (queue-priority preserve)
+        rested_ord_id: str = ""
+        rested_price: float = 0.0
+        rested_credited_qty: float = 0.0
+        last_ord_id: str = ""
+
         log.info(
             "chase_buy_put_start",
             symbol=symbol,
@@ -887,32 +931,119 @@ class BybitExchange:
                             else (cached.bid + cached.ask) / 2)
                 captured_ref = True
 
+            # ── 0. Credit any fills on the existing resting order ──
+            if rested_ord_id:
+                status = await self._read_option_order(symbol, rested_ord_id)
+                state = status.get("orderStatus", "")
+                cum_qty = float(status.get("cumExecQty", 0) or 0)
+                avg_px = float(status.get("avgPrice", rested_price) or rested_price)
+                delta = max(0.0, cum_qty - rested_credited_qty)
+                if delta > 0:
+                    weighted_cost += avg_px * delta
+                    total_filled += delta
+                    remaining_qty = round(remaining_qty - delta, 5)
+                    rested_credited_qty = cum_qty
+                    log.info(
+                        "chase_buy_resting_fill_credit",
+                        symbol=symbol, attempt=attempt,
+                        ord_id=rested_ord_id, delta=delta,
+                        total_filled=total_filled, remaining=remaining_qty,
+                        state=state,
+                    )
+                if state == "Filled" or remaining_qty <= 0:
+                    avg_price = (weighted_cost / total_filled) if total_filled > 0 else avg_px
+                    t_filled = _time.time()
+                    metrics = _build_fill_metrics(
+                        side="buy", instrument=symbol,
+                        qty_btc=total_filled, fill_price=avg_price,
+                        t_started=t_started, t_filled=t_filled,
+                        attempts=attempt,
+                        ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
+                    )
+                    log.info(
+                        "chase_buy_filled",
+                        symbol=symbol, price=avg_price,
+                        total_filled=total_filled, attempt=attempt,
+                        duration_sec=metrics["duration_sec"],
+                        slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
+                        saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"],
+                    )
+                    return {
+                        "orderId": rested_ord_id,
+                        "orderStatus": "Filled",
+                        "avgPrice": str(avg_price),
+                        "metrics": metrics,
+                    }
+                if state in ("Cancelled", "Rejected", "Deactivated", ""):
+                    rested_ord_id = ""
+                    rested_price = 0.0
+                    rested_credited_qty = 0.0
+
+            # ── 1. Compute new price ──
             if cached and cached.bid > 0 and cached.ask > 0:
                 target_ceiling = cached.ask - tick
-                # 50% gap narrowing toward (ask − 1 tick)
                 if current_price < target_ceiling:
                     gap = target_ceiling - current_price
                     current_price = _round_price_up(
                         current_price + gap * config.OPTION_CHASE_GAP_NARROW_PCT
                     )
-                # Hard fair-value cap: never above mark × MAX_SLIPPAGE_FACTOR
                 mark = cached.mark if cached.mark > 0 else (cached.bid + cached.ask) / 2
                 cap = _round_price_up(mark * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR)
                 if current_price > cap:
                     log.debug(
                         "chase_buy_capped_at_fair_value",
-                        symbol=symbol,
-                        attempted_price=current_price,
-                        cap=cap,
-                        mark=mark,
+                        symbol=symbol, attempted_price=current_price,
+                        cap=cap, mark=mark,
                     )
                     current_price = cap
-                # Always stay below ask (post-only / maker)
                 current_price = min(current_price, target_ceiling)
             else:
-                # WS hasn't delivered yet — small bid-side increment as safety
                 current_price = _round_price_up(current_price + tick)
 
+            # ── 2. Keep-alive: same price as resting order? ──
+            same_price = (rested_ord_id and
+                          abs(rested_price - current_price) < tick * 0.5)
+
+            if same_price:
+                log.info(
+                    "chase_buy_keep_alive",
+                    symbol=symbol, attempt=attempt,
+                    price=current_price, ord_id=rested_ord_id,
+                    remaining=remaining_qty,
+                )
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
+
+            # ── 3. Reprice: cancel resting order, credit any final fills ──
+            if rested_ord_id:
+                log.info(
+                    "chase_buy_reprice",
+                    symbol=symbol, attempt=attempt,
+                    from_price=rested_price, to_price=current_price,
+                    ord_id=rested_ord_id,
+                )
+                await self.cancel_order("option", symbol, rested_ord_id)
+                final = await self._get_order_final_state("option", symbol, rested_ord_id)
+                final_cum = float(final.get("cumExecQty", 0) or 0)
+                final_avg = float(final.get("avgPrice", rested_price) or rested_price)
+                delta = max(0.0, final_cum - rested_credited_qty)
+                if delta > 0:
+                    weighted_cost += final_avg * delta
+                    total_filled += delta
+                    remaining_qty = round(remaining_qty - delta, 5)
+                    log.info(
+                        "chase_buy_reprice_partial_credit",
+                        symbol=symbol, attempt=attempt,
+                        delta=delta, total_filled=total_filled,
+                        remaining=remaining_qty,
+                    )
+                rested_ord_id = ""
+                rested_price = 0.0
+                rested_credited_qty = 0.0
+                if remaining_qty <= 0:
+                    break
+
+            # ── 4. Place new order at current_price ──
             result = await self._place_option_limit(
                 "Buy", symbol, remaining_qty, current_price
             )
@@ -926,65 +1057,31 @@ class BybitExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            fill = await self._wait_option_fill(
-                symbol, order_id, timeout=config.OPTION_CHASE_INTERVAL_SEC
-            )
+            rested_ord_id = order_id
+            rested_price = current_price
+            rested_credited_qty = 0.0
+            last_ord_id = order_id
+            await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
 
-            if fill and fill.get("orderStatus") == "Filled":
-                fill_price = float(fill.get("avgPrice", current_price))
-                weighted_cost += fill_price * remaining_qty
-                total_filled += remaining_qty
-                remaining_qty = 0.0
-                avg_price = weighted_cost / total_filled
-                t_filled = _time.time()
-                metrics = _build_fill_metrics(
-                    side="buy", instrument=symbol,
-                    qty_btc=total_filled, fill_price=avg_price,
-                    t_started=t_started, t_filled=t_filled,
-                    attempts=attempt,
-                    ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
-                )
+        # ── Loop exit: cancel any remaining resting order, credit fills ──
+        if rested_ord_id:
+            await self.cancel_order("option", symbol, rested_ord_id)
+            final = await self._get_order_final_state("option", symbol, rested_ord_id)
+            final_cum = float(final.get("cumExecQty", 0) or 0)
+            final_avg = float(final.get("avgPrice", rested_price) or rested_price)
+            delta = max(0.0, final_cum - rested_credited_qty)
+            if delta > 0:
+                weighted_cost += final_avg * delta
+                total_filled += delta
+                remaining_qty = round(remaining_qty - delta, 5)
                 log.info(
-                    "chase_buy_filled",
-                    symbol=symbol,
-                    price=fill_price,
-                    total_filled=total_filled,
-                    attempt=attempt,
-                    duration_sec=metrics["duration_sec"],
-                    slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
-                    saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"],
+                    "chase_buy_exit_partial_credit",
+                    symbol=symbol, attempt=attempt,
+                    delta=delta, total_filled=total_filled,
                 )
-                return {
-                    "orderId": order_id,
-                    "orderStatus": "Filled",
-                    "avgPrice": str(avg_price),
-                    "metrics": metrics,
-                }
-
-            await self.cancel_order("option", symbol, order_id)
-            final = await self._get_order_final_state("option", symbol, order_id)
-            cum_qty = float(final.get("cumExecQty", 0))
-            if cum_qty > 0:
-                fill_price = float(final.get("avgPrice", current_price))
-                weighted_cost += fill_price * cum_qty
-                total_filled += cum_qty
-                remaining_qty = round(remaining_qty - cum_qty, 5)
-                log.info(
-                    "chase_buy_partial",
-                    symbol=symbol,
-                    filled=cum_qty,
-                    remaining=remaining_qty,
-                    attempt=attempt,
-                )
-
-            log.debug(
-                "chase_buy_reprice",
-                symbol=symbol,
-                attempt=attempt,
-                remaining=remaining_qty,
-                next_price=current_price,
-                time_left=int(deadline - _time.time()),
-            )
+            rested_ord_id = ""
+            rested_price = 0.0
+            rested_credited_qty = 0.0
 
         # ── Deadline expired ──
         if total_filled > 0:
@@ -1005,7 +1102,7 @@ class BybitExchange:
                 attempts=attempt,
             )
             return {
-                "orderId": "partial",
+                "orderId": last_ord_id or "partial",
                 "orderStatus": "PartiallyFilled",
                 "avgPrice": str(avg_price),
                 "cumExecQty": str(total_filled),
@@ -1024,21 +1121,12 @@ class BybitExchange:
         self, symbol: str, qty: float, initial_ask: float,
     ) -> dict | None:
         """
-        Maker-only persistent sell with 50% bid-ask gap narrowing and
-        a fair-value floor derived from the option mark price.
+        Maker-only persistent sell with 50% bid-ask gap narrowing, fair-value
+        floor, and queue-priority preservation (added 2026-05-13).
 
-        Strategy:
-          - Start at the current ask (or initial_ask if WS not ready).
-          - On each no-fill cycle, narrow the remaining gap toward
-            (bid + 1 tick) by OPTION_CHASE_GAP_NARROW_PCT (default 50%).
-          - Never post below mark / OPTION_CHASE_MAX_SLIPPAGE_FACTOR
-            (default 1.15).
-          - Bail when OPTION_CHASE_DEADLINE_SEC expires — no taker fallback.
-
-        Partial fills accumulate. On full fill returns the filled order
-        dict; on partial fill at deadline returns a synthetic dict with
-        orderStatus='PartiallyFilled'.
-        Returns None only when nothing filled before the deadline.
+        Mirrors chase_buy_put — see that docstring for the keep-alive
+        semantics. Returns same shape on full fill, partial-fill-at-deadline,
+        and total-zero-fill cases.
 
         Args:
             initial_ask: REST-snapshot ask, used as the starting price when
@@ -1057,6 +1145,12 @@ class BybitExchange:
         t_started = _time.time()
         ref_bid = ref_ask = ref_mark = 0.0
         captured_ref = False
+
+        # Resting-order state across iterations (queue-priority preserve)
+        rested_ord_id: str = ""
+        rested_price: float = 0.0
+        rested_credited_qty: float = 0.0
+        last_ord_id: str = ""
 
         log.info(
             "chase_sell_put_start",
@@ -1080,15 +1174,62 @@ class BybitExchange:
                             else (cached.bid + cached.ask) / 2)
                 captured_ref = True
 
+            # ── 0. Credit any fills on the existing resting order ──
+            if rested_ord_id:
+                status = await self._read_option_order(symbol, rested_ord_id)
+                state = status.get("orderStatus", "")
+                cum_qty = float(status.get("cumExecQty", 0) or 0)
+                avg_px = float(status.get("avgPrice", rested_price) or rested_price)
+                delta = max(0.0, cum_qty - rested_credited_qty)
+                if delta > 0:
+                    weighted_revenue += avg_px * delta
+                    total_filled += delta
+                    remaining_qty = round(remaining_qty - delta, 5)
+                    rested_credited_qty = cum_qty
+                    log.info(
+                        "chase_sell_resting_fill_credit",
+                        symbol=symbol, attempt=attempt,
+                        ord_id=rested_ord_id, delta=delta,
+                        total_filled=total_filled, remaining=remaining_qty,
+                        state=state,
+                    )
+                if state == "Filled" or remaining_qty <= 0:
+                    avg_price = (weighted_revenue / total_filled) if total_filled > 0 else avg_px
+                    t_filled = _time.time()
+                    metrics = _build_fill_metrics(
+                        side="sell", instrument=symbol,
+                        qty_btc=total_filled, fill_price=avg_price,
+                        t_started=t_started, t_filled=t_filled,
+                        attempts=attempt,
+                        ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
+                    )
+                    log.info(
+                        "chase_sell_filled",
+                        symbol=symbol, price=avg_price,
+                        total_filled=total_filled, attempt=attempt,
+                        duration_sec=metrics["duration_sec"],
+                        slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
+                        saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"],
+                    )
+                    return {
+                        "orderId": rested_ord_id,
+                        "orderStatus": "Filled",
+                        "avgPrice": str(avg_price),
+                        "metrics": metrics,
+                    }
+                if state in ("Cancelled", "Rejected", "Deactivated", ""):
+                    rested_ord_id = ""
+                    rested_price = 0.0
+                    rested_credited_qty = 0.0
+
+            # ── 1. Compute new price ──
             if cached and cached.bid > 0 and cached.ask > 0:
                 target_floor = cached.bid + tick
-                # 50% gap narrowing toward (bid + 1 tick)
                 if current_price > target_floor:
                     gap = current_price - target_floor
                     current_price = _round_price_down(
                         current_price - gap * config.OPTION_CHASE_GAP_NARROW_PCT
                     )
-                # Hard fair-value floor: never below mark / MAX_SLIPPAGE_FACTOR
                 mark = cached.mark if cached.mark > 0 else (cached.bid + cached.ask) / 2
                 floor_price = _round_price_down(
                     mark / config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
@@ -1096,18 +1237,58 @@ class BybitExchange:
                 if current_price < floor_price:
                     log.debug(
                         "chase_sell_floored_at_fair_value",
-                        symbol=symbol,
-                        attempted_price=current_price,
-                        floor=floor_price,
-                        mark=mark,
+                        symbol=symbol, attempted_price=current_price,
+                        floor=floor_price, mark=mark,
                     )
                     current_price = floor_price
-                # Always stay above bid (post-only / maker)
                 current_price = max(current_price, target_floor)
             else:
-                # WS hasn't delivered yet — small ask-side decrement as safety
                 current_price = _round_price_down(max(tick, current_price - tick))
 
+            # ── 2. Keep-alive: same price as resting order? ──
+            same_price = (rested_ord_id and
+                          abs(rested_price - current_price) < tick * 0.5)
+
+            if same_price:
+                log.info(
+                    "chase_sell_keep_alive",
+                    symbol=symbol, attempt=attempt,
+                    price=current_price, ord_id=rested_ord_id,
+                    remaining=remaining_qty,
+                )
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
+
+            # ── 3. Reprice: cancel resting order, credit any final fills ──
+            if rested_ord_id:
+                log.info(
+                    "chase_sell_reprice",
+                    symbol=symbol, attempt=attempt,
+                    from_price=rested_price, to_price=current_price,
+                    ord_id=rested_ord_id,
+                )
+                await self.cancel_order("option", symbol, rested_ord_id)
+                final = await self._get_order_final_state("option", symbol, rested_ord_id)
+                final_cum = float(final.get("cumExecQty", 0) or 0)
+                final_avg = float(final.get("avgPrice", rested_price) or rested_price)
+                delta = max(0.0, final_cum - rested_credited_qty)
+                if delta > 0:
+                    weighted_revenue += final_avg * delta
+                    total_filled += delta
+                    remaining_qty = round(remaining_qty - delta, 5)
+                    log.info(
+                        "chase_sell_reprice_partial_credit",
+                        symbol=symbol, attempt=attempt,
+                        delta=delta, total_filled=total_filled,
+                        remaining=remaining_qty,
+                    )
+                rested_ord_id = ""
+                rested_price = 0.0
+                rested_credited_qty = 0.0
+                if remaining_qty <= 0:
+                    break
+
+            # ── 4. Place new order at current_price ──
             result = await self._place_option_limit(
                 "Sell", symbol, remaining_qty, current_price, reduce=True
             )
@@ -1121,65 +1302,31 @@ class BybitExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            fill = await self._wait_option_fill(
-                symbol, order_id, timeout=config.OPTION_CHASE_INTERVAL_SEC
-            )
+            rested_ord_id = order_id
+            rested_price = current_price
+            rested_credited_qty = 0.0
+            last_ord_id = order_id
+            await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
 
-            if fill and fill.get("orderStatus") == "Filled":
-                fill_price = float(fill.get("avgPrice", current_price))
-                weighted_revenue += fill_price * remaining_qty
-                total_filled += remaining_qty
-                remaining_qty = 0.0
-                avg_price = weighted_revenue / total_filled
-                t_filled = _time.time()
-                metrics = _build_fill_metrics(
-                    side="sell", instrument=symbol,
-                    qty_btc=total_filled, fill_price=avg_price,
-                    t_started=t_started, t_filled=t_filled,
-                    attempts=attempt,
-                    ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
-                )
+        # ── Loop exit: cancel any remaining resting order, credit fills ──
+        if rested_ord_id:
+            await self.cancel_order("option", symbol, rested_ord_id)
+            final = await self._get_order_final_state("option", symbol, rested_ord_id)
+            final_cum = float(final.get("cumExecQty", 0) or 0)
+            final_avg = float(final.get("avgPrice", rested_price) or rested_price)
+            delta = max(0.0, final_cum - rested_credited_qty)
+            if delta > 0:
+                weighted_revenue += final_avg * delta
+                total_filled += delta
+                remaining_qty = round(remaining_qty - delta, 5)
                 log.info(
-                    "chase_sell_filled",
-                    symbol=symbol,
-                    price=fill_price,
-                    total_filled=total_filled,
-                    attempt=attempt,
-                    duration_sec=metrics["duration_sec"],
-                    slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
-                    saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"],
+                    "chase_sell_exit_partial_credit",
+                    symbol=symbol, attempt=attempt,
+                    delta=delta, total_filled=total_filled,
                 )
-                return {
-                    "orderId": order_id,
-                    "orderStatus": "Filled",
-                    "avgPrice": str(avg_price),
-                    "metrics": metrics,
-                }
-
-            await self.cancel_order("option", symbol, order_id)
-            final = await self._get_order_final_state("option", symbol, order_id)
-            cum_qty = float(final.get("cumExecQty", 0))
-            if cum_qty > 0:
-                fill_price = float(final.get("avgPrice", current_price))
-                weighted_revenue += fill_price * cum_qty
-                total_filled += cum_qty
-                remaining_qty = round(remaining_qty - cum_qty, 5)
-                log.info(
-                    "chase_sell_partial",
-                    symbol=symbol,
-                    filled=cum_qty,
-                    remaining=remaining_qty,
-                    attempt=attempt,
-                )
-
-            log.debug(
-                "chase_sell_reprice",
-                symbol=symbol,
-                attempt=attempt,
-                remaining=remaining_qty,
-                next_price=current_price,
-                time_left=int(deadline - _time.time()),
-            )
+            rested_ord_id = ""
+            rested_price = 0.0
+            rested_credited_qty = 0.0
 
         # ── Deadline expired ──
         if total_filled > 0:
@@ -1200,7 +1347,7 @@ class BybitExchange:
                 attempts=attempt,
             )
             return {
-                "orderId": "partial",
+                "orderId": last_ord_id or "partial",
                 "orderStatus": "PartiallyFilled",
                 "avgPrice": str(avg_price),
                 "cumExecQty": str(total_filled),
