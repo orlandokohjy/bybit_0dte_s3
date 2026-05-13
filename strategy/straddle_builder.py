@@ -175,7 +175,7 @@ async def build_straddle(
             await notifier.send(
                 f"<b>ENTRY SKIPPED</b> [{straddle_id}]\n"
                 f"Put chase deadline expired "
-                f"({config.OPTION_CHASE_DEADLINE_SEC:.0f}s)\n"
+                f"({config.OPTION_ENTRY_CHASE_DEADLINE_SEC:.0f}s)\n"
                 f"Leg {i + 1}/{config.NUM_PUTS} did not fill — "
                 f"spot NOT purchased.\n"
                 f"No directional exposure. Session closed for the day."

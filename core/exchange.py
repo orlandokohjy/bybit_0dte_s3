@@ -892,7 +892,7 @@ class BybitExchange:
         if config.DRY_RUN:
             return self._fake_order("Buy", symbol, qty, _round_price_up(initial_bid))
 
-        deadline = _time.time() + config.OPTION_CHASE_DEADLINE_SEC
+        deadline = _time.time() + config.OPTION_ENTRY_CHASE_DEADLINE_SEC
         tick = config.OPTION_TICK_SIZE
         remaining_qty = qty
         weighted_cost = 0.0
@@ -914,7 +914,7 @@ class BybitExchange:
             symbol=symbol,
             qty=qty,
             initial_bid=initial_bid,
-            deadline_sec=config.OPTION_CHASE_DEADLINE_SEC,
+            deadline_sec=config.OPTION_ENTRY_CHASE_DEADLINE_SEC,
             gap_narrow_pct=config.OPTION_CHASE_GAP_NARROW_PCT,
             max_slippage_factor=config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR,
         )
@@ -1113,7 +1113,7 @@ class BybitExchange:
             "chase_buy_deadline_expired",
             symbol=symbol,
             attempts=attempt,
-            deadline_sec=config.OPTION_CHASE_DEADLINE_SEC,
+            deadline_sec=config.OPTION_ENTRY_CHASE_DEADLINE_SEC,
         )
         return None
 
@@ -1135,7 +1135,7 @@ class BybitExchange:
         if config.DRY_RUN:
             return self._fake_order("Sell", symbol, qty, _round_price_down(initial_ask))
 
-        deadline = _time.time() + config.OPTION_CHASE_DEADLINE_SEC
+        deadline = _time.time() + config.OPTION_EXIT_CHASE_DEADLINE_SEC
         tick = config.OPTION_TICK_SIZE
         remaining_qty = qty
         weighted_revenue = 0.0
@@ -1157,7 +1157,7 @@ class BybitExchange:
             symbol=symbol,
             qty=qty,
             initial_ask=initial_ask,
-            deadline_sec=config.OPTION_CHASE_DEADLINE_SEC,
+            deadline_sec=config.OPTION_EXIT_CHASE_DEADLINE_SEC,
             gap_narrow_pct=config.OPTION_CHASE_GAP_NARROW_PCT,
             max_slippage_factor=config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR,
         )
@@ -1358,7 +1358,7 @@ class BybitExchange:
             "chase_sell_deadline_expired",
             symbol=symbol,
             attempts=attempt,
-            deadline_sec=config.OPTION_CHASE_DEADLINE_SEC,
+            deadline_sec=config.OPTION_EXIT_CHASE_DEADLINE_SEC,
         )
         return None
 

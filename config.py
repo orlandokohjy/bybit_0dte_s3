@@ -196,9 +196,35 @@ SPOT_TICK_SIZE: float = 0.10               # BTCUSDT spot tick
 
 OPTION_CHASE_INTERVAL_SEC: float = 3.0
 OPTION_CHASE_MAX_ATTEMPTS: int = 50        # legacy
-OPTION_CHASE_DEADLINE_SEC: float = float(
-    os.getenv("OPTION_CHASE_DEADLINE_SEC", "3600.0")  # 60 min, mirrors OKX
+# ── Maker-chase deadlines: split per direction ──
+# Entry chase MUST finish within the session window. Morning session is
+# only 60 min long (01:00 → 02:00 UTC), so entry deadline cannot exceed
+# 60 min without risking a race where the entry completes after the
+# scheduled session close, leaving the straddle without an unwind handler.
+#
+# Exit chase is free to run past session close (no scheduler race), capped
+# only by the 08:00 UTC option expiry. ~2 hours dramatically improves
+# fill quality in dying 0DTE books where the spread can sit one tick wide
+# for tens of minutes before the ask collapses.
+#
+# Legacy single-knob `OPTION_CHASE_DEADLINE_SEC` is honored as a fallback
+# so existing deployments keep working without an env edit.
+_LEGACY_CHASE_DEADLINE_SEC = os.getenv("OPTION_CHASE_DEADLINE_SEC")
+OPTION_ENTRY_CHASE_DEADLINE_SEC: float = float(
+    os.getenv(
+        "OPTION_ENTRY_CHASE_DEADLINE_SEC",
+        _LEGACY_CHASE_DEADLINE_SEC if _LEGACY_CHASE_DEADLINE_SEC else "3600.0",
+    )
 )
+OPTION_EXIT_CHASE_DEADLINE_SEC: float = float(
+    os.getenv(
+        "OPTION_EXIT_CHASE_DEADLINE_SEC",
+        _LEGACY_CHASE_DEADLINE_SEC if _LEGACY_CHASE_DEADLINE_SEC else "7200.0",
+    )
+)
+# Kept for backward-compatibility imports; new code should reference
+# OPTION_ENTRY_CHASE_DEADLINE_SEC or OPTION_EXIT_CHASE_DEADLINE_SEC.
+OPTION_CHASE_DEADLINE_SEC: float = OPTION_EXIT_CHASE_DEADLINE_SEC
 OPTION_CHASE_GAP_NARROW_PCT: float = float(
     os.getenv("OPTION_CHASE_GAP_NARROW_PCT", "0.5")
 )
