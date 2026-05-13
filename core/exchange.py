@@ -871,7 +871,7 @@ class BybitExchange:
             (ask − 1 tick) by OPTION_CHASE_GAP_NARROW_PCT (default 50%).
           - Never post above mark × OPTION_CHASE_MAX_SLIPPAGE_FACTOR
             (default 1.15).
-          - Bail when OPTION_CHASE_DEADLINE_SEC expires — no taker fallback.
+          - Bail when OPTION_ENTRY_CHASE_DEADLINE_SEC expires — no taker fallback.
 
         Queue priority:
           - If the recomputed price equals the resting order's price, the
